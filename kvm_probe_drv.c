@@ -19,7 +19,6 @@
 #include <linux/pagemap.h>
 #include <linux/kdev_t.h>
 #include <linux/err.h>
-#include <linux/kallsyms.h>
 #include <linux/static_call.h>
 #include <linux/set_memory.h>
 #include <linux/pgtable.h>
@@ -33,6 +32,12 @@
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <asm/io.h>
+#include <linux/in.h>
+#include <linux/cdev.h>
+
+#ifndef HAVE_IN4_PTON
+extern int in4_pton(const char *src, int srclen, u8 *dst, int delim, const char **end);
+#endif
 
 #define DRIVER_NAME       "kvm_probe_drv"
 #define DEVICE_FILE_NAME  "kvm_probe_dev"
@@ -162,8 +167,6 @@ typedef int (*set_memory_op_t)(unsigned long, int);
 static set_memory_op_t my_set_memory_rw = NULL;
 static set_memory_op_t my_set_memory_ro = NULL;
 
-/* Function pointer for kallsyms_lookup_name */
-static unsigned long (*my_kallsyms_lookup_name)(const char *name) = NULL;
 
 // Simple address range check
 static bool is_valid_kernel_addr(unsigned long addr)
@@ -177,7 +180,7 @@ static bool is_valid_kernel_addr(unsigned long addr)
 #endif
 
 // Virtqueue callback function
-static bool vq_callback(struct virtqueue *vq)
+static bool __maybe_unused vq_callback(struct virtqueue *vq)
 {
     pr_info("%s: Virtqueue callback triggered\n", DRIVER_NAME);
     return true;
@@ -226,8 +229,13 @@ static int create_net_packet(unsigned char *buffer, unsigned int *length,
     ip->ttl = 64;
     ip->protocol = IPPROTO_UDP;
     ip->check = 0;
-    ip->saddr = in_aton(src_ip);
-    ip->daddr = in_aton(dest_ip);
+    {
+        __be32 saddr = 0, daddr = 0;
+        in4_pton(src_ip, -1, (u8 *)&saddr, -1, NULL);
+        in4_pton(dest_ip, -1, (u8 *)&daddr, -1, NULL);
+        ip->saddr = saddr;
+        ip->daddr = daddr;
+    }
     
     // UDP header
     udp = (struct udphdr *)(buffer + sizeof(struct ethhdr) + sizeof(struct iphdr));
@@ -421,18 +429,8 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             break;
         }
         case IOCTL_GET_KASLR_SLIDE: {
+            // KASLR slide calculation not supported without kallsyms_lookup_name
             unsigned long slide = 0;
-            unsigned long kernel_base = 0;
-
-            if (my_kallsyms_lookup_name) {
-                kernel_base = my_kallsyms_lookup_name("startup_64");
-                if (!kernel_base) kernel_base = my_kallsyms_lookup_name("_text");
-
-                if (kernel_base) {
-                    slide = kernel_base - 0xffffffff81000000ul;
-                }
-            }
-
             if (copy_to_user(user_arg, &slide, sizeof(slide))) return -EFAULT;
             ret = 0;
             break;
@@ -577,7 +575,7 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         case IOCTL_SEND_NET_PACKET: {
             struct net_packet_data data;
             unsigned char packet_buffer[1514]; // Standard Ethernet MTU
-            unsigned int packet_len = sizeof(packet_buffer);
+            // Unused variable removed
             
             if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
             if (data.packet_len > sizeof(packet_buffer)) return -EINVAL;
@@ -646,35 +644,12 @@ static struct file_operations fops = {
 static dev_t dev_num;
 static struct class *dev_class;
 static struct device *dev_device;
+static struct cdev cdev;
 
-static int __init driver_init(void)
+static int __init kvm_probe_driver_init(void)
 {
     int ret;
-    unsigned long lookup_addr;
-
     pr_info("%s: Initializing\n", DRIVER_NAME);
-
-    // Try to get kallsyms_lookup_name
-    lookup_addr = kallsyms_lookup_name("kallsyms_lookup_name");
-    if (lookup_addr) {
-        my_kallsyms_lookup_name = (void *)lookup_addr;
-        pr_info("%s: Found kallsyms_lookup_name at %p\n", DRIVER_NAME, my_kallsyms_lookup_name);
-    } else {
-        pr_warn("%s: kallsyms_lookup_name not found\n", DRIVER_NAME);
-    }
-
-    // Try to get set_memory_rw/ro
-    lookup_addr = kallsyms_lookup_name("set_memory_rw");
-    if (lookup_addr) {
-        my_set_memory_rw = (set_memory_op_t)lookup_addr;
-        pr_info("%s: Found set_memory_rw at %p\n", DRIVER_NAME, my_set_memory_rw);
-    }
-
-    lookup_addr = kallsyms_lookup_name("set_memory_ro");
-    if (lookup_addr) {
-        my_set_memory_ro = (set_memory_op_t)lookup_addr;
-        pr_info("%s: Found set_memory_ro at %p\n", DRIVER_NAME, my_set_memory_ro);
-    }
 
     // Allocate device number
     ret = alloc_chrdev_region(&dev_num, 0, 1, DRIVER_NAME);
@@ -740,7 +715,7 @@ static void __exit driver_exit(void)
     pr_info("%s: Exited\n", DRIVER_NAME);
 }
 
-module_init(driver_init);
+module_init(kvm_probe_driver_init);
 module_exit(driver_exit);
 
 MODULE_LICENSE("GPL");
