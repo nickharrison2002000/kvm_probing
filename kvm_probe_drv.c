@@ -70,6 +70,9 @@ struct virtio_device_state {
 static struct virtio_device_state virtio_devices[MAX_VIRTIO_DEVICES];
 static int num_virtio_devices = 0;
 
+// Forward declaration
+static struct virtio_device_state *find_virtio_device(unsigned int device_id);
+
 /* IOCTL command definitions (must match prober) */
 #define IOCTL_READ_PORT          0x1001
 #define IOCTL_WRITE_PORT         0x1002
@@ -179,6 +182,7 @@ static bool vq_callback(struct virtqueue *vq)
     pr_info("%s: Virtqueue callback triggered\n", DRIVER_NAME);
     return true;
 }
+
 
 // Find virtio device by ID
 static struct virtio_device_state *find_virtio_device(unsigned int device_id)
