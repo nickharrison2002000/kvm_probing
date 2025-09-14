@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Build
+/build/
+*.o
+*.ko
+*.mod.c
+*.symvers
+*.order
+*.bin
+*.out
+
+# Kernel headers
+linux-headers-*.deb
+
+# Editor
+.vscode/

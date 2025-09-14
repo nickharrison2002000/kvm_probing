@@ -1,0 +1,3 @@
+# Python requirements for kvm_probing
+# All dependencies are from the Python standard library.
+# No third-party packages required.
