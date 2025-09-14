@@ -169,10 +169,10 @@ class KVMExploiter:
         
     def get_kaslr_slide(self) -> int:
         """Get KASLR slide"""
-        slide = ctypes.c_ulong()
-        self._ioctl(IOCTL_GET_KASLR_SLIDE, ctypes.byref(slide))
-        self.kaslr_slide = slide.value
-        return self.kaslr_slide
+    slide = ctypes.c_ulong()
+    self._ioctl(IOCTL_GET_KASLR_SLIDE, ctypes.addressof(slide))
+    self.kaslr_slide = slide.value
+    return self.kaslr_slide
         
     def hypercall_args(self, nr: int, arg0: int = 0, arg1: int = 0, 
                       arg2: int = 0, arg3: int = 0) -> int:
