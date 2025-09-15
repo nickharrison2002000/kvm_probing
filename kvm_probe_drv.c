@@ -35,6 +35,8 @@
 #include <linux/in.h>
 #include <linux/cdev.h>
 #include <asm/io.h>
+#include <linux/kprobes.h>
+
 
 #define DRIVER_NAME       "kvm_probe_drv"
 #define DEVICE_FILE_NAME  "kvm_probe_dev"
@@ -44,6 +46,9 @@
 #define MAX_COPY_SIZE     4096
 #define MAX_VIRTIO_DEVICES 8
 #define VIRTIO_NET_DEVICE_ID 1
+#ifndef KVM_HC_VIRTIO_NOTIFY
+#define KVM_HC_VIRTIO_NOTIFY 8   /* old upstream value */
+#endif
 
 // Define KVM hypercalls for CTF flags
 #ifndef KVM_HC_CTF_FLAG_100
@@ -78,11 +83,18 @@ struct virtio_device_state {
     unsigned long vq_pfn;
     unsigned int queue_index;
     bool attached;
-    struct virtqueue *vq;
+    struct virtqueue *vq;   /* needed for attach/detach */
 };
 
+/* Active device pointer (used in ioctl ops) */
+static struct virtio_device_state *dev_state;
+
+/* Device table */
 static struct virtio_device_state virtio_devices[MAX_VIRTIO_DEVICES];
 static int num_virtio_devices = 0;
+
+/* Forward declaration */
+static struct virtio_device_state *find_virtio_device(unsigned int device_id);
 
 /* IOCTL command definitions (must match prober) */
 #define IOCTL_READ_PORT          0x1001
@@ -120,6 +132,7 @@ struct port_io_data {
     unsigned int   size;
     unsigned int   value;
 };
+
 struct mmio_data {
     unsigned long phys_addr;
     unsigned long size;
@@ -127,6 +140,7 @@ struct mmio_data {
     unsigned long single_value;
     unsigned int  value_size;
 };
+
 struct vq_desc_user_data {
     unsigned short index;
     unsigned long long phys_addr;
@@ -134,26 +148,31 @@ struct vq_desc_user_data {
     unsigned short flags;
     unsigned short next_idx;
 };
+
 struct kvm_kernel_mem_read {
     unsigned long  kernel_addr;
     unsigned long  length;
     unsigned char *user_buf;
 };
+
 struct kvm_kernel_mem_write {
     unsigned long  kernel_addr;
     unsigned long  length;
     unsigned char *user_buf;
 };
+
 struct va_scan_data {
     unsigned long  va;
     unsigned long  size;
     unsigned char *user_buffer;
 };
+
 struct va_write_data {
     unsigned long  va;
     unsigned long  size;
     unsigned char *user_buffer;
 };
+
 struct hypercall_args {
     unsigned long nr;
     unsigned long arg0;
@@ -161,21 +180,25 @@ struct hypercall_args {
     unsigned long arg2;
     unsigned long arg3;
 };
+
 struct attach_vq_data {
     unsigned int   device_id;
     unsigned long  vq_pfn;
     unsigned int   queue_index;
 };
+
 struct net_packet_data {
     unsigned char *packet_data;
     unsigned int   packet_len;
     unsigned int   device_id;
 };
+
 struct ctf_flag_data {
     unsigned int flag_id;
     unsigned long address;
     unsigned long value;
 };
+
 
 /* Function pointers for set_memory_* that are filled at init time */
 typedef int (*set_memory_op_t)(unsigned long, int);
@@ -478,7 +501,7 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                                     kernel_buf = kmalloc(req.size, GFP_KERNEL);
                                     if (!kernel_buf) return -ENOMEM;
                                     if (copy_from_user(kernel_buf, req.user_buffer, req.size)) {
-                                        kfree(kkernel_buf);
+                                        kfree(kernel_buf);
                                         return -EFAULT;
                                     }
                                     memcpy((void*)req.va, kernel_buf, req.size);
@@ -774,43 +797,54 @@ static struct virtio_device_state *find_virtio_device(unsigned int device_id)
     return NULL;
 }
 
+static unsigned long (*my_kallsyms_lookup_name)(const char *name);
+
 static int __init kvm_probe_init(void)
 {
     int ret;
     unsigned long lookup_addr;
+    struct kprobe kp = {
+        .symbol_name = "kallsyms_lookup_name",
+    };
 
     pr_info("%s: Initializing\n", DRIVER_NAME);
 
-    // Try to get kallsyms_lookup_name
-    lookup_addr = kallsyms_lookup_name("kallsyms_lookup_name");
-    if (lookup_addr) {
-        my_kallsyms_lookup_name = (void *)lookup_addr;
-        pr_info("%s: Found kallsyms_lookup_name at %p\n", DRIVER_NAME, my_kallsyms_lookup_name);
+    /* Use kprobe to resolve kallsyms_lookup_name */
+    if (register_kprobe(&kp) < 0) {
+        pr_err("%s: Failed to register kprobe for kallsyms_lookup_name\n", DRIVER_NAME);
+        return -EINVAL;
+    }
+    my_kallsyms_lookup_name = (void *)kp.addr;
+    unregister_kprobe(&kp);
+
+    if (my_kallsyms_lookup_name) {
+        pr_info("%s: Resolved kallsyms_lookup_name at %p\n", DRIVER_NAME, my_kallsyms_lookup_name);
+
+        /* Lookup set_memory_rw */
+        lookup_addr = my_kallsyms_lookup_name("set_memory_rw");
+        if (lookup_addr) {
+            my_set_memory_rw = (set_memory_op_t)lookup_addr;
+            pr_info("%s: Found set_memory_rw at %p\n", DRIVER_NAME, my_set_memory_rw);
+        }
+
+        /* Lookup set_memory_ro */
+        lookup_addr = my_kallsyms_lookup_name("set_memory_ro");
+        if (lookup_addr) {
+            my_set_memory_ro = (set_memory_op_t)lookup_addr;
+            pr_info("%s: Found set_memory_ro at %p\n", DRIVER_NAME, my_set_memory_ro);
+        }
     } else {
-        pr_warn("%s: kallsyms_lookup_name not found\n", DRIVER_NAME);
+        pr_warn("%s: kallsyms_lookup_name not resolved\n", DRIVER_NAME);
     }
 
-    // Try to get set_memory_rw/ro
-    lookup_addr = kallsyms_lookup_name("set_memory_rw");
-    if (lookup_addr) {
-        my_set_memory_rw = (set_memory_op_t)lookup_addr;
-        pr_info("%s: Found set_memory_rw at %p\n", DRIVER_NAME, my_set_memory_rw);
-    }
-
-    lookup_addr = kallsyms_lookup_name("set_memory_ro");
-    if (lookup_addr) {
-        my_set_memory_ro = (set_memory_op_t)lookup_addr;
-        pr_info("%s: Found set_memory_ro at %p\n", DRIVER_NAME, my_set_memory_ro);
-    }
-
-    // Allocate device number
+    /* Allocate device number */
     ret = alloc_chrdev_region(&dev_num, 0, 1, DRIVER_NAME);
     if (ret < 0) {
         pr_err("%s: Failed to allocate device number\n", DRIVER_NAME);
         return ret;
     }
 
-    // Create device class
+    /* Create device class */
     dev_class = class_create(THIS_MODULE, DRIVER_NAME);
     if (IS_ERR(dev_class)) {
         pr_err("%s: Failed to create device class\n", DRIVER_NAME);
@@ -818,7 +852,7 @@ static int __init kvm_probe_init(void)
         return PTR_ERR(dev_class);
     }
 
-    // Create device
+    /* Create device */
     dev_device = device_create(dev_class, NULL, dev_num, NULL, DEVICE_FILE_NAME);
     if (IS_ERR(dev_device)) {
         pr_err("%s: Failed to create device\n", DRIVER_NAME);
@@ -827,7 +861,7 @@ static int __init kvm_probe_init(void)
         return PTR_ERR(dev_device);
     }
 
-    // Register character device
+    /* Register character device */
     cdev_init(&cdev, &fops);
     ret = cdev_add(&cdev, dev_num, 1);
     if (ret < 0) {
