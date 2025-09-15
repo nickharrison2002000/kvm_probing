@@ -1,0 +1,70 @@
+### Host runs v6.1.74 Intel(R) Xeon(R) Gold 5222 CPU @ 3.80GHz ###
+### Guest runs Debian 12.5 (bookworm) v6.1.0-21 kernel ###
+
+    +ESCAPE FLAG PATH:
+[*] Host rce_flag: /root/rce_flag
+
+    +Trigger flag:
+--> Hypercall 100
+--> Arbitrary read/write 50k - 100k
+
+    +FLAG:                       +ADDRESSES:
+[*] Write flag Virtual address:  0xffffffff826279a8
+[*] Write flag physical address: 0x64279a8
+[*] Read flag Virtual address:   0xffffffff82b5ee10
+[*] Read flag physical address:  0x695ee10
+
+    +Trigger flag:
+--> Hypercall 102
+--> Relative memory read/write 10k - 50k
+
+    +Trigger KASAN violation:
+[*] induce a null-ptr-deref KASAN violation
+
+    +Trigger flag:
+--> hypercall #103
+--> DOS 50k
+
+
+[*] INSTALL KVM_PROBING
+
+git clone --recursive https://github.com/nickharrison2002000/kvm_Probing
+
+
+
+[*] REWARDS
+
+    +TIER:                         +REWARD:
+--> Full VM escape                 $250,000
+--> Arbitrary memory write         $100,000
+--> Arbitrary memory read          $50,000
+--> Relative memory write          $50,000
+--> Denial of Service              $20,000
+--> Relative memory read           $10,000
+
+=========================================================================
+
+KASLR slide: 0x31600000
+Kernel base: 0xffffffffb2600000
+prepare_kernel_cred: 0xffffffffb26d0cc0
+commit_creds: 0xffffffffb26d0a10
+set_memory_ro: 0xffffffffb268ce30
+
+[ 2675.002857] kvm_probe_drv: Resolved kallsyms_lookup_name at 00000000d55d4665
+[ 2675.002921] kvm_probe_drv: Found set_memory_rw at 0000000047c2d2c4
+[ 2675.002945] kvm_probe_drv: Found set_memory_ro at 000000006611417f
+=========================================================================
+
+Addressses Host
+0xffffffff826279a8
+0x64279a8
+0xffffffff82b5ee10
+0x695ee10
+
+Addresses Guest w\slide
+0xffffffffb2c279a8
+0xffffffffbbd879a8
+0x7fd879a8
+0xffffffffb315ee10
+0xffffffff8335ee10
+0x3695ee10
