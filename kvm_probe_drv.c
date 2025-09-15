@@ -19,6 +19,7 @@
 #include <linux/pagemap.h>
 #include <linux/kdev_t.h>
 #include <linux/err.h>
+#include <linux/kallsyms.h>
 #include <linux/static_call.h>
 #include <linux/set_memory.h>
 #include <linux/pgtable.h>
@@ -31,13 +32,9 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
-#include <asm/io.h>
 #include <linux/in.h>
 #include <linux/cdev.h>
-
-#ifndef HAVE_IN4_PTON
-extern int in4_pton(const char *src, int srclen, u8 *dst, int delim, const char **end);
-#endif
+#include <asm/io.h>
 
 #define DRIVER_NAME       "kvm_probe_drv"
 #define DEVICE_FILE_NAME  "kvm_probe_dev"
@@ -74,9 +71,6 @@ struct virtio_device_state {
 
 static struct virtio_device_state virtio_devices[MAX_VIRTIO_DEVICES];
 static int num_virtio_devices = 0;
-
-// Forward declaration
-static struct virtio_device_state *find_virtio_device(unsigned int device_id);
 
 /* IOCTL command definitions (must match prober) */
 #define IOCTL_READ_PORT          0x1001
@@ -167,57 +161,42 @@ typedef int (*set_memory_op_t)(unsigned long, int);
 static set_memory_op_t my_set_memory_rw = NULL;
 static set_memory_op_t my_set_memory_ro = NULL;
 
-
-// Simple address range check
-static bool is_valid_kernel_addr(unsigned long addr)
-{
-    return (addr >= PAGE_OFFSET);
-}
+/* Function pointer for kallsyms_lookup_name */
+static unsigned long (*my_kallsyms_lookup_name)(const char *name) = NULL;
 
 // Fallback implementation of virt_to_pfn if not available
 #ifndef virt_to_pfn
 #define virt_to_pfn(addr) (page_to_pfn(virt_to_page(addr)))
 #endif
 
-// Virtqueue callback function
-static bool __maybe_unused vq_callback(struct virtqueue *vq)
+// Convert IP string to integer (replacement for in_aton)
+static __be32 ip_to_int(const char *ip_str)
 {
-    pr_info("%s: Virtqueue callback triggered\n", DRIVER_NAME);
-    return true;
-}
-
-
-// Find virtio device by ID
-static struct virtio_device_state *find_virtio_device(unsigned int device_id)
-{
-    int i;
-    for (i = 0; i < num_virtio_devices; i++) {
-        if (virtio_devices[i].device_id == device_id) {
-            return &virtio_devices[i];
-        }
-    }
-    return NULL;
+    unsigned int a, b, c, d;
+    if (sscanf(ip_str, "%u.%u.%u.%u", &a, &b, &c, &d) != 4)
+        return 0;
+    return htonl((a << 24) | (b << 16) | (c << 8) | d);
 }
 
 // Create a simple network packet
-static int create_net_packet(unsigned char *buffer, unsigned int *length, 
-                           const char *dest_ip, const char *src_ip,
-                           unsigned short dest_port, unsigned short src_port)
+static int create_net_packet(unsigned char *buffer, unsigned int *length,
+                             const char *dest_ip, const char *src_ip,
+                             unsigned short dest_port, unsigned short src_port)
 {
     struct ethhdr *eth;
     struct iphdr *ip;
     struct udphdr *udp;
     char *payload;
-    
+
     if (*length < sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + 10)
         return -EINVAL;
-    
+
     // Ethernet header
     eth = (struct ethhdr *)buffer;
     memset(eth->h_dest, 0xff, ETH_ALEN); // broadcast
     memset(eth->h_source, 0x00, ETH_ALEN);
     eth->h_proto = htons(ETH_P_IP);
-    
+
     // IP header
     ip = (struct iphdr *)(buffer + sizeof(struct ethhdr));
     ip->version = 4;
@@ -229,25 +208,20 @@ static int create_net_packet(unsigned char *buffer, unsigned int *length,
     ip->ttl = 64;
     ip->protocol = IPPROTO_UDP;
     ip->check = 0;
-    {
-        __be32 saddr = 0, daddr = 0;
-        in4_pton(src_ip, -1, (u8 *)&saddr, -1, NULL);
-        in4_pton(dest_ip, -1, (u8 *)&daddr, -1, NULL);
-        ip->saddr = saddr;
-        ip->daddr = daddr;
-    }
-    
+    ip->saddr = ip_to_int(src_ip);
+    ip->daddr = ip_to_int(dest_ip);
+
     // UDP header
     udp = (struct udphdr *)(buffer + sizeof(struct ethhdr) + sizeof(struct iphdr));
     udp->source = htons(src_port);
     udp->dest = htons(dest_port);
     udp->len = htons(sizeof(struct udphdr) + 10);
     udp->check = 0;
-    
+
     // Payload
     payload = (char *)(buffer + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr));
     strncpy(payload, "CTF_PACKET", 10);
-    
+
     *length = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + 10;
     return 0;
 }
@@ -271,352 +245,361 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             ret = 0;
             break;
         }
-        case IOCTL_WRITE_PORT: {
-            struct port_io_data data;
-            if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
-            switch (data.size) {
-                case 1: outb(data.value, data.port); break;
-                case 2: outw(data.value, data.port); break;
-                case 4: outl(data.value, data.port); break;
-                default: return -EINVAL;
-            }
-            ret = 0;
-            break;
-        }
-        case IOCTL_READ_MMIO: {
-            struct mmio_data data;
-            if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
-            void __iomem *virt_addr = ioremap(data.phys_addr, data.size);
-            if (!virt_addr) return -ENOMEM;
-            if (copy_to_user(data.user_buffer, virt_addr, data.size)) ret = -EFAULT;
-            else ret = 0;
-            iounmap(virt_addr);
-            break;
-        }
-        case IOCTL_WRITE_MMIO: {
-            struct mmio_data data;
-            if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
-            void __iomem *virt_addr = ioremap(data.phys_addr, data.value_size);
-            if (!virt_addr) return -ENOMEM;
-            switch (data.value_size) {
-                case 1: writeb(data.single_value, virt_addr); break;
-                case 2: writew(data.single_value, virt_addr); break;
-                case 4: writel(data.single_value, virt_addr); break;
-                case 8: writeq(data.single_value, virt_addr); break;
-                default: ret = -EINVAL; goto mmio_write_out;
-            }
-            ret = 0;
-        mmio_write_out:
-            iounmap(virt_addr);
-            break;
-        }
-        case IOCTL_ALLOC_VQ_PAGE: {
-            if (g_vq_virt_addr) { ret = -ENOMEM; break; }
-            g_vq_virt_addr = (void*)__get_free_pages(GFP_KERNEL | __GFP_ZERO, VQ_PAGE_ORDER);
-            if (!g_vq_virt_addr) { ret = -ENOMEM; break; }
-            g_vq_pfn = virt_to_pfn(g_vq_virt_addr);
-            g_vq_phys_addr = PFN_PHYS(g_vq_pfn);
-            g_vq_gpa = g_vq_phys_addr;
-            if (copy_to_user(user_arg, &g_vq_pfn, sizeof(g_vq_pfn))) ret = -EFAULT;
-            else ret = 0;
-            break;
-        }
-        case IOCTL_FREE_VQ_PAGE: {
-            if (g_vq_virt_addr) {
-                free_pages((unsigned long)g_vq_virt_addr, VQ_PAGE_ORDER);
-                g_vq_virt_addr = NULL;
-                g_vq_phys_addr = 0;
-                g_vq_pfn = 0;
-                ret = 0;
-            } else {
-                ret = -ENODATA;
-            }
-            break;
-        }
-        case IOCTL_WRITE_VQ_DESC: {
-            if (!g_vq_virt_addr) { ret = -ENODATA; break; }
-            struct vq_desc_user_data data;
-            if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
-            if (data.index >= VQ_PAGE_SIZE / 16) { ret = -EINVAL; break; } // Assuming 16-byte descriptor size
-            u64 *desc = (u64 *)g_vq_virt_addr;
-            desc[data.index * 2] = data.phys_addr;
-            desc[data.index * 2 + 1] = (u64)data.len | ((u64)data.flags << 32) | ((u64)data.next_idx << 48);
-            ret = 0;
-            break;
-        }
-        case IOCTL_TRIGGER_HYPERCALL: {
-            unsigned long hypercall_ret;
-            if (allow_untrusted_hypercalls) {
-                hypercall_ret = kvm_hypercall0(KVM_HC_VIRTIO_NOTIFY);
-                if (copy_to_user(user_arg, &hypercall_ret, sizeof(hypercall_ret))) ret = -EFAULT;
-                else ret= 0;
-            } else {
-                ret= -EACCES;
-            }
-            break;
-        }
-        case IOCTL_READ_KERNEL_MEM: {
-            struct kvm_kernel_mem_read r;
-            if (copy_from_user(&r, user_arg, sizeof(r))) return -EFAULT;
-            if (r.length > MAX_COPY_SIZE || !is_valid_kernel_addr(r.kernel_addr)) {
-                return -EINVAL;
-            }
-            if (copy_to_user(r.user_buf, (const void*)r.kernel_addr, r.length)) return -EFAULT;
-            ret = 0;
-            break;
-        }
-        case IOCTL_WRITE_KERNEL_MEM: {
-            struct kvm_kernel_mem_write w;
-            void *kbuf;
-            if (copy_from_user(&w, user_arg, sizeof(w))) return -EFAULT;
-            if (w.length > MAX_COPY_SIZE || !is_valid_kernel_addr(w.kernel_addr)) {
-                return -EINVAL;
-            }
-            kbuf = kmalloc(w.length, GFP_KERNEL);
-            if (!kbuf) return -ENOMEM;
-            if (copy_from_user(kbuf, w.user_buf, w.length)) {
-                kfree(kbuf);
-                return -EFAULT;
-            }
-            memcpy((void*)w.kernel_addr, kbuf, w.length);
-            kfree(kbuf);
-            ret = 0;
-            break;
-        }
-        case IOCTL_PATCH_INSTRUCTIONS: {
-            struct va_scan_data req;
-            void *kernel_buf;
-            if (copy_from_user(&req, user_arg, sizeof(req))) return -EFAULT;
-            if (!my_set_memory_rw || !my_set_memory_ro) {
-                pr_err("%s: Missing function pointers for set_memory operations\n", DRIVER_NAME);
-                return -ENODEV;
-            }
-
-            if (!req.user_buffer) {
-                return -EINVAL;
-            }
-
-            ret = my_set_memory_rw(req.va, 1);
-            if (ret) {
-                pr_err("%s: set_memory_rw failed: %ld\n", DRIVER_NAME, ret);
-                return ret;
-            }
-
-            kernel_buf = kmalloc(req.size, GFP_KERNEL);
-            if (!kernel_buf) {
-                my_set_memory_ro(req.va, 1);
-                return -ENOMEM;
-            }
-            if (copy_from_user(kernel_buf, req.user_buffer, req.size)) {
-                ret = -EFAULT;
-            } else {
-                ret = 0;
-            }
-            kfree(kernel_buf);
-
-            my_set_memory_ro(req.va, 1);
-
-            break;
-        }
-        case IOCTL_READ_FLAG_ADDR: {
-            if (copy_to_user(user_arg, &g_flag_addr, sizeof(g_flag_addr))) return -EFAULT;
-            ret = 0;
-            break;
-        }
-        case IOCTL_WRITE_FLAG_ADDR: {
-            if (copy_from_user(&g_flag_addr, user_arg, sizeof(g_flag_addr))) return -EFAULT;
-            ret = 0;
-            break;
-        }
-        case IOCTL_GET_KASLR_SLIDE: {
-            // KASLR slide calculation not supported without kallsyms_lookup_name
-            unsigned long slide = 0;
-            if (copy_to_user(user_arg, &slide, sizeof(slide))) return -EFAULT;
-            ret = 0;
-            break;
-        }
-        case IOCTL_VIRT_TO_PHYS: {
-            unsigned long virt_addr;
-            unsigned long phys_addr;
-            if (copy_from_user(&virt_addr, user_arg, sizeof(virt_addr))) return -EFAULT;
-            phys_addr = virt_to_phys((void*)virt_addr);
-            if (copy_to_user(user_arg, &phys_addr, sizeof(phys_addr))) return -EFAULT;
-            ret = 0;
-            break;
-        }
-        case IOCTL_SCAN_VA: {
-            struct va_scan_data req;
-            void *kernel_buf;
-            if (copy_from_user(&req, user_arg, sizeof(req))) return -EFAULT;
-            if (req.size > MAX_COPY_SIZE) return -EINVAL;
-            kernel_buf = kmalloc(req.size, GFP_KERNEL);
-            if (!kernel_buf) return -ENOMEM;
-            memcpy(kernel_buf, (void*)req.va, req.size);
-            if (copy_to_user(req.user_buffer, kernel_buf, req.size)) ret = -EFAULT;
-            else ret = 0;
-            kfree(kernel_buf);
-            break;
-        }
-        case IOCTL_WRITE_VA: {
-            struct va_write_data req;
-            void *kernel_buf;
-            if (copy_from_user(&req, user_arg, sizeof(req))) return -EFAULT;
-            if (req.size > MAX_COPY_SIZE) return -EINVAL;
-            kernel_buf = kmalloc(req.size, GFP_KERNEL);
-            if (!kernel_buf) return -ENOMEM;
-            if (copy_from_user(kernel_buf, req.user_buffer, req.size)) {
-                kfree(kernel_buf);
-                return -EFAULT;
-            }
-            memcpy((void*)req.va, kernel_buf, req.size);
-            kfree(kernel_buf);
-            ret = 0;
-            break;
-        }
-        case IOCTL_HYPERCALL_ARGS: {
-            struct hypercall_args args;
-            unsigned long hypercall_ret;
-            if (copy_from_user(&args, user_arg, sizeof(args))) return -EFAULT;
-            if (allow_untrusted_hypercalls) {
-                hypercall_ret = kvm_hypercall4(args.nr, args.arg0, args.arg1, args.arg2, args.arg3);
-                if (copy_to_user(user_arg, &hypercall_ret, sizeof(hypercall_ret))) ret = -EFAULT;
-                else ret = 0;
-            } else {
-                ret = -EACCES;
-            }
-            break;
-        }
-        case IOCTL_ATTACH_VQ: {
-            struct attach_vq_data data;
-            struct virtio_device_state *dev_state;
-            
-            if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
-            
-            // Find or create device state
-            dev_state = find_virtio_device(data.device_id);
-            if (!dev_state) {
-                if (num_virtio_devices >= MAX_VIRTIO_DEVICES) {
-                    return -ENOSPC;
+                case IOCTL_WRITE_PORT: {
+                    struct port_io_data data;
+                    if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
+                    switch (data.size) {
+                        case 1: outb(data.value, data.port); break;
+                        case 2: outw(data.value, data.port); break;
+                        case 4: outl(data.value, data.port); break;
+                        default: return -EINVAL;
+                    }
+                    ret = 0;
+                    break;
                 }
-                dev_state = &virtio_devices[num_virtio_devices++];
-                dev_state->device_id = data.device_id;
-            }
-            
-            dev_state->vq_pfn = data.vq_pfn;
-            dev_state->queue_index = data.queue_index;
-            dev_state->attached = true;
-            
-            pr_info("%s: Attached virtqueue: device_id=%u, vq_pfn=%lu, queue_index=%u\n",
-                   DRIVER_NAME, data.device_id, data.vq_pfn, data.queue_index);
-            ret = 0;
-            break;
-        }
-        case IOCTL_TRIGGER_VQ: {
-            struct attach_vq_data data;
-            struct virtio_device_state *dev_state;
-            unsigned long hypercall_ret;
-            
-            if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
-            
-            dev_state = find_virtio_device(data.device_id);
-            if (!dev_state || !dev_state->attached) {
-                return -ENODEV;
-            }
-            
-            // Trigger hypercall to notify the hypervisor
-            hypercall_ret = kvm_hypercall2(KVM_HC_VIRTIO_NOTIFY, data.device_id, dev_state->queue_index);
-            
-            if (copy_to_user(user_arg, &hypercall_ret, sizeof(hypercall_ret))) ret = -EFAULT;
-            else ret = 0;
-            break;
-        }
-        case IOCTL_SCAN_PHYS: {
-            struct mmio_data data;
-            void __iomem *virt_addr;
-            void *kernel_buf;
-            
-            if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
-            if (data.size > MAX_COPY_SIZE) return -EINVAL;
-            
-            virt_addr = ioremap(data.phys_addr, data.size);
-            if (!virt_addr) return -ENOMEM;
-            
-            kernel_buf = kmalloc(data.size, GFP_KERNEL);
-            if (!kernel_buf) {
-                iounmap(virt_addr);
-                return -ENOMEM;
-            }
-            
-            memcpy_fromio(kernel_buf, virt_addr, data.size);
-            
-            if (copy_to_user(data.user_buffer, kernel_buf, data.size)) ret = -EFAULT;
-            else ret = 0;
-            
-            kfree(kernel_buf);
-            iounmap(virt_addr);
-            break;
-        }
-        case IOCTL_FIRE_VQ_ALL: {
-            int i;
-            unsigned long hypercall_ret;
-            
-            for (i = 0; i < num_virtio_devices; i++) {
-                if (virtio_devices[i].attached) {
-                    hypercall_ret = kvm_hypercall2(KVM_HC_VIRTIO_NOTIFY, 
-                                                 virtio_devices[i].device_id, 
-                                                 virtio_devices[i].queue_index);
-                    pr_info("%s: Fired virtqueue %d: device_id=%u, ret=%lu\n",
-                           DRIVER_NAME, i, virtio_devices[i].device_id, hypercall_ret);
-                }
-            }
-            ret = 0;
-            break;
-        }
-        case IOCTL_SEND_NET_PACKET: {
-            struct net_packet_data data;
-            unsigned char packet_buffer[1514]; // Standard Ethernet MTU
-            // Unused variable removed
-            
-            if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
-            if (data.packet_len > sizeof(packet_buffer)) return -EINVAL;
-            
-            if (copy_from_user(packet_buffer, data.packet_data, data.packet_len)) return -EFAULT;
-            
-            // For now, just log the packet
-            pr_info("%s: Would send network packet: device_id=%u, len=%u\n",
-                   DRIVER_NAME, data.device_id, data.packet_len);
-            
-            // Trigger virtqueue notification
-            if (data.device_id != 0) {
-                kvm_hypercall2(KVM_HC_VIRTIO_NOTIFY, data.device_id, 0);
-            }
-            
-            ret = 0;
-            break;
-        }
-        case IOCTL_RECV_NET_PACKET: {
-            struct net_packet_data data;
-            unsigned char packet_buffer[1514];
-            unsigned int packet_len;
-            
-            if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
-            
-            // Create a sample packet
-            packet_len = sizeof(packet_buffer);
-            if (create_net_packet(packet_buffer, &packet_len, "10.0.0.1", "10.0.0.2", 1234, 80) < 0) {
-                return -EINVAL;
-            }
-            
-            if (copy_to_user(data.packet_data, packet_buffer, packet_len)) return -EFAULT;
-            if (copy_to_user(&((struct net_packet_data __user *)user_arg)->packet_len, 
-                           &packet_len, sizeof(packet_len))) return -EFAULT;
-            
-            ret = 0;
-            break;
-        }
-        default:
-            ret = -ENOTTY;
-            break;
+                        case IOCTL_READ_MMIO: {
+                            struct mmio_data data;
+                            if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
+                            void __iomem *virt_addr = ioremap(data.phys_addr, data.size);
+                            if (!virt_addr) return -ENOMEM;
+                            if (copy_to_user(data.user_buffer, virt_addr, data.size)) ret = -EFAULT;
+                            else ret = 0;
+                            iounmap(virt_addr);
+                            break;
+                        }
+                        case IOCTL_WRITE_MMIO: {
+                            struct mmio_data data;
+                            if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
+                            void __iomem *virt_addr = ioremap(data.phys_addr, data.value_size);
+                            if (!virt_addr) return -ENOMEM;
+                            switch (data.value_size) {
+                                case 1: writeb(data.single_value, virt_addr); break;
+                                case 2: writew(data.single_value, virt_addr); break;
+                                case 4: writel(data.single_value, virt_addr); break;
+                                case 8: writeq(data.single_value, virt_addr); break;
+                                default: ret = -EINVAL; goto mmio_write_out;
+                            }
+                            ret = 0;
+                            mmio_write_out:
+                            iounmap(virt_addr);
+                            break;
+                        }
+                                case IOCTL_ALLOC_VQ_PAGE: {
+                                    if (g_vq_virt_addr) { ret = -ENOMEM; break; }
+                                    g_vq_virt_addr = (void*)__get_free_pages(GFP_KERNEL | __GFP_ZERO, VQ_PAGE_ORDER);
+                                    if (!g_vq_virt_addr) { ret = -ENOMEM; break; }
+                                    g_vq_pfn = virt_to_pfn(g_vq_virt_addr);
+                                    g_vq_phys_addr = PFN_PHYS(g_vq_pfn);
+                                    g_vq_gpa = g_vq_phys_addr;
+                                    if (copy_to_user(user_arg, &g_vq_pfn, sizeof(g_vq_pfn))) ret = -EFAULT;
+                                    else ret = 0;
+                                    break;
+                                }
+                                case IOCTL_FREE_VQ_PAGE: {
+                                    if (g_vq_virt_addr) {
+                                        free_pages((unsigned long)g_vq_virt_addr, VQ_PAGE_ORDER);
+                                        g_vq_virt_addr = NULL;
+                                        g_vq_phys_addr = 0;
+                                        g_vq_pfn = 0;
+                                        ret = 0;
+                                    } else {
+                                        ret = -ENODATA;
+                                    }
+                                    break;
+                                }
+                                case IOCTL_WRITE_VQ_DESC: {
+                                    if (!g_vq_virt_addr) { ret = -ENODATA; break; }
+                                    struct vq_desc_user_data data;
+                                    if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
+                                    if (data.index >= VQ_PAGE_SIZE / 16) { ret = -EINVAL; break; } // Assuming 16-byte descriptor size
+                                    u64 *desc = (u64 *)g_vq_virt_addr;
+                                    desc[data.index * 2] = data.phys_addr;
+                                    desc[data.index * 2 + 1] = (u64)data.len | ((u64)data.flags << 32) | ((u64)data.next_idx << 48);
+                                    ret = 0;
+                                    break;
+                                }
+                                case IOCTL_TRIGGER_HYPERCALL: {
+                                    unsigned long hypercall_ret;
+                                    if (allow_untrusted_hypercalls) {
+                                        hypercall_ret = kvm_hypercall0(KVM_HC_VIRTIO_NOTIFY);
+                                        if (copy_to_user(user_arg, &hypercall_ret, sizeof(hypercall_ret))) ret = -EFAULT;
+                                        else ret= 0;
+                                    } else {
+                                        ret= -EACCES;
+                                    }
+                                    break;
+                                }
+                                case IOCTL_READ_KERNEL_MEM: {
+                                    struct kvm_kernel_mem_read r;
+                                    if (copy_from_user(&r, user_arg, sizeof(r))) return -EFAULT;
+                                    if (r.length > MAX_COPY_SIZE) {
+                                        return -EINVAL;
+                                    }
+                                    if (copy_to_user(r.user_buf, (const void*)r.kernel_addr, r.length)) return -EFAULT;
+                                    ret = 0;
+                                    break;
+                                }
+                                case IOCTL_WRITE_KERNEL_MEM: {
+                                    struct kvm_kernel_mem_write w;
+                                    void *kbuf;
+                                    if (copy_from_user(&w, user_arg, sizeof(w))) return -EFAULT;
+                                    if (w.length > MAX_COPY_SIZE) {
+                                        return -EINVAL;
+                                    }
+                                    kbuf = kmalloc(w.length, GFP_KERNEL);
+                                    if (!kbuf) return -ENOMEM;
+                                    if (copy_from_user(kbuf, w.user_buf, w.length)) {
+                                        kfree(kbuf);
+                                        return -EFAULT;
+                                    }
+                                    memcpy((void*)w.kernel_addr, kbuf, w.length);
+                                    kfree(kbuf);
+                                    ret = 0;
+                                    break;
+                                }
+                                case IOCTL_PATCH_INSTRUCTIONS: {
+                                    struct va_scan_data req;
+                                    void *kernel_buf;
+                                    if (copy_from_user(&req, user_arg, sizeof(req))) return -EFAULT;
+                                    if (!my_set_memory_rw || !my_set_memory_ro) {
+                                        pr_err("%s: Missing function pointers for set_memory operations\n", DRIVER_NAME);
+                                        return -ENODEV;
+                                    }
+
+                                    if (!req.user_buffer) {
+                                        return -EINVAL;
+                                    }
+
+                                    ret = my_set_memory_rw(req.va, 1);
+                                    if (ret) {
+                                        pr_err("%s: set_memory_rw failed: %ld\n", DRIVER_NAME, ret);
+                                        return ret;
+                                    }
+
+                                    kernel_buf = kmalloc(req.size, GFP_KERNEL);
+                                    if (!kernel_buf) {
+                                        my_set_memory_ro(req.va, 1);
+                                        return -ENOMEM;
+                                    }
+                                    if (copy_from_user(kernel_buf, req.user_buffer, req.size)) {
+                                        ret = -EFAULT;
+                                    } else {
+                                        ret = 0;
+                                    }
+                                    kfree(kernel_buf);
+
+                                    my_set_memory_ro(req.va, 1);
+
+                                    break;
+                                }
+                                case IOCTL_READ_FLAG_ADDR: {
+                                    if (copy_to_user(user_arg, &g_flag_addr, sizeof(g_flag_addr))) return -EFAULT;
+                                    ret = 0;
+                                    break;
+                                }
+                                case IOCTL_WRITE_FLAG_ADDR: {
+                                    if (copy_from_user(&g_flag_addr, user_arg, sizeof(g_flag_addr))) return -EFAULT;
+                                    ret = 0;
+                                    break;
+                                }
+                                case IOCTL_GET_KASLR_SLIDE: {
+                                    unsigned long slide = 0;
+                                    unsigned long kernel_base = 0;
+
+                                    if (my_kallsyms_lookup_name) {
+                                        kernel_base = my_kallsyms_lookup_name("startup_64");
+                                        if (!kernel_base) kernel_base = my_kallsyms_lookup_name("_text");
+
+                                        if (kernel_base) {
+                                            slide = kernel_base - 0xffffffff81000000ul;
+                                        }
+                                    }
+
+                                    if (copy_to_user(user_arg, &slide, sizeof(slide))) return -EFAULT;
+                                    ret = 0;
+                                    break;
+                                }
+                                case IOCTL_VIRT_TO_PHYS: {
+                                    unsigned long virt_addr;
+                                    unsigned long phys_addr;
+                                    if (copy_from_user(&virt_addr, user_arg, sizeof(virt_addr))) return -EFAULT;
+                                    phys_addr = virt_to_phys((void*)virt_addr);
+                                    if (copy_to_user(user_arg, &phys_addr, sizeof(phys_addr))) return -EFAULT;
+                                    ret = 0;
+                                    break;
+                                }
+                                case IOCTL_SCAN_VA: {
+                                    struct va_scan_data req;
+                                    void *kernel_buf;
+                                    if (copy_from_user(&req, user_arg, sizeof(req))) return -EFAULT;
+                                    if (req.size > MAX_COPY_SIZE) return -EINVAL;
+                                    kernel_buf = kmalloc(req.size, GFP_KERNEL);
+                                    if (!kernel_buf) return -ENOMEM;
+                                    memcpy(kernel_buf, (void*)req.va, req.size);
+                                    if (copy_to_user(req.user_buffer, kernel_buf, req.size)) ret = -EFAULT;
+                                    else ret = 0;
+                                    kfree(kernel_buf);
+                                    break;
+                                }
+                                case IOCTL_WRITE_VA: {
+                                    struct va_write_data req;
+                                    void *kernel_buf;
+                                    if (copy_from_user(&req, user_arg, sizeof(req))) return -EFAULT;
+                                    if (req.size > MAX_COPY_SIZE) return -EINVAL;
+                                    kernel_buf = kmalloc(req.size, GFP_KERNEL);
+                                    if (!kernel_buf) return -ENOMEM;
+                                    if (copy_from_user(kernel_buf, req.user_buffer, req.size)) {
+                                        kfree(kkernel_buf);
+                                        return -EFAULT;
+                                    }
+                                    memcpy((void*)req.va, kernel_buf, req.size);
+                                    kfree(kernel_buf);
+                                    ret = 0;
+                                    break;
+                                }
+                                case IOCTL_HYPERCALL_ARGS: {
+                                    struct hypercall_args args;
+                                    unsigned long hypercall_ret;
+                                    if (copy_from_user(&args, user_arg, sizeof(args))) return -EFAULT;
+                                    if (allow_untrusted_hypercalls) {
+                                        hypercall_ret = kvm_hypercall4(args.nr, args.arg0, args.arg1, args.arg2, args.arg3);
+                                        if (copy_to_user(user_arg, &hypercall_ret, sizeof(hypercall_ret))) ret = -EFAULT;
+                                        else ret = 0;
+                                    } else {
+                                        ret = -EACCES;
+                                    }
+                                    break;
+                                }
+                                case IOCTL_ATTACH_VQ: {
+                                    struct attach_vq_data data;
+                                    struct virtio_device_state *dev_state;
+
+                                    if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
+
+                                    // Find or create device state
+                                    dev_state = find_virtio_device(data.device_id);
+                                    if (!dev_state) {
+                                        if (num_virtio_devices >= MAX_VIRTIO_DEVICES) {
+                                            return -ENOSPC;
+                                        }
+                                        dev_state = &virtio_devices[num_virtio_devices++];
+                                        dev_state->device_id = data.device_id;
+                                    }
+
+                                    dev_state->vq_pfn = data.vq_pfn;
+                                    dev_state->queue_index = data.queue_index;
+                                    dev_state->attached = true;
+
+                                    pr_info("%s: Attached virtqueue: device_id=%u, vq_pfn=%lu, queue_index=%u\n",
+                                            DRIVER_NAME, data.device_id, data.vq_pfn, data.queue_index);
+                                    ret = 0;
+                                    break;
+                                }
+                                case IOCTL_TRIGGER_VQ: {
+                                    struct attach_vq_data data;
+                                    struct virtio_device_state *dev_state;
+                                    unsigned long hypercall_ret;
+
+                                    if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
+
+                                    dev_state = find_virtio_device(data.device_id);
+                                    if (!dev_state || !dev_state->attached) {
+                                        return -ENODEV;
+                                    }
+
+                                    // Trigger hypercall to notify the hypervisor
+                                    hypercall_ret = kvm_hypercall2(KVM_HC_VIRTIO_NOTIFY, data.device_id, dev_state->queue_index);
+
+                                    if (copy_to_user(user_arg, &hypercall_ret, sizeof(hypercall_ret))) ret = -EFAULT;
+                                    else ret = 0;
+                                    break;
+                                }
+                                case IOCTL_SCAN_PHYS: {
+                                    struct mmio_data data;
+                                    void __iomem *virt_addr;
+                                    void *kernel_buf;
+
+                                    if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
+                                    if (data.size > MAX_COPY_SIZE) return -EINVAL;
+
+                                    virt_addr = ioremap(data.phys_addr, data.size);
+                                    if (!virt_addr) return -ENOMEM;
+
+                                    kernel_buf = kmalloc(data.size, GFP_KERNEL);
+                                    if (!kernel_buf) {
+                                        iounmap(virt_addr);
+                                        return -ENOMEM;
+                                    }
+
+                                    memcpy_fromio(kernel_buf, virt_addr, data.size);
+
+                                    if (copy_to_user(data.user_buffer, kernel_buf, data.size)) ret = -EFAULT;
+                                    else ret = 0;
+
+                                    kfree(kernel_buf);
+                                    iounmap(virt_addr);
+                                    break;
+                                }
+                                case IOCTL_FIRE_VQ_ALL: {
+                                    int i;
+                                    unsigned long hypercall_ret;
+
+                                    for (i = 0; i < num_virtio_devices; i++) {
+                                        if (virtio_devices[i].attached) {
+                                            hypercall_ret = kvm_hypercall2(KVM_HC_VIRTIO_NOTIFY,
+                                                                           virtio_devices[i].device_id,
+                                                                           virtio_devices[i].queue_index);
+                                            pr_info("%s: Fired virtqueue %d: device_id=%u, ret=%lu\n",
+                                                    DRIVER_NAME, i, virtio_devices[i].device_id, hypercall_ret);
+                                        }
+                                    }
+                                    ret = 0;
+                                    break;
+                                }
+                                case IOCTL_SEND_NET_PACKET: {
+                                    struct net_packet_data data;
+                                    unsigned char packet_buffer[1514]; // Standard Ethernet MTU
+
+                                    if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
+                                    if (data.packet_len > sizeof(packet_buffer)) return -EINVAL;
+
+                                    if (copy_from_user(packet_buffer, data.packet_data, data.packet_len)) return -EFAULT;
+
+                                    // For now, just log the packet
+                                    pr_info("%s: Would send network packet: device_id=%u, len=%u\n",
+                                            DRIVER_NAME, data.device_id, data.packet_len);
+
+                                    // Trigger virtqueue notification
+                                    if (data.device_id != 0) {
+                                        kvm_hypercall2(KVM_HC_VIRTIO_NOTIFY, data.device_id, 0);
+                                    }
+
+                                    ret = 0;
+                                    break;
+                                }
+                                case IOCTL_RECV_NET_PACKET: {
+                                    struct net_packet_data data;
+                                    unsigned char packet_buffer[1514];
+                                    unsigned int packet_len;
+
+                                    if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
+
+                                    // Create a sample packet
+                                    packet_len = sizeof(packet_buffer);
+                                    if (create_net_packet(packet_buffer, &packet_len, "10.0.0.1", "10.0.0.2", 1234, 80) < 0) {
+                                        return -EINVAL;
+                                    }
+
+                                    if (copy_to_user(data.packet_data, packet_buffer, packet_len)) return -EFAULT;
+                                    if (copy_to_user(&((struct net_packet_data __user *)user_arg)->packet_len,
+                                        &packet_len, sizeof(packet_len))) return -EFAULT;
+
+                                    ret = 0;
+                                    break;
+                                }
+                                default:
+                                    ret = -ENOTTY;
+                                    break;
     }
 
     return ret;
@@ -646,10 +629,46 @@ static struct class *dev_class;
 static struct device *dev_device;
 static struct cdev cdev;
 
-static int __init kvm_probe_driver_init(void)
+// Find virtio device by ID
+static struct virtio_device_state *find_virtio_device(unsigned int device_id)
+{
+    int i;
+    for (i = 0; i < num_virtio_devices; i++) {
+        if (virtio_devices[i].device_id == device_id) {
+            return &virtio_devices[i];
+        }
+    }
+    return NULL;
+}
+
+static int __init kvm_probe_init(void)
 {
     int ret;
+    unsigned long lookup_addr;
+
     pr_info("%s: Initializing\n", DRIVER_NAME);
+
+    // Try to get kallsyms_lookup_name
+    lookup_addr = kallsyms_lookup_name("kallsyms_lookup_name");
+    if (lookup_addr) {
+        my_kallsyms_lookup_name = (void *)lookup_addr;
+        pr_info("%s: Found kallsyms_lookup_name at %p\n", DRIVER_NAME, my_kallsyms_lookup_name);
+    } else {
+        pr_warn("%s: kallsyms_lookup_name not found\n", DRIVER_NAME);
+    }
+
+    // Try to get set_memory_rw/ro
+    lookup_addr = kallsyms_lookup_name("set_memory_rw");
+    if (lookup_addr) {
+        my_set_memory_rw = (set_memory_op_t)lookup_addr;
+        pr_info("%s: Found set_memory_rw at %p\n", DRIVER_NAME, my_set_memory_rw);
+    }
+
+    lookup_addr = kallsyms_lookup_name("set_memory_ro");
+    if (lookup_addr) {
+        my_set_memory_ro = (set_memory_op_t)lookup_addr;
+        pr_info("%s: Found set_memory_ro at %p\n", DRIVER_NAME, my_set_memory_ro);
+    }
 
     // Allocate device number
     ret = alloc_chrdev_region(&dev_num, 0, 1, DRIVER_NAME);
@@ -690,7 +709,7 @@ static int __init kvm_probe_driver_init(void)
     return 0;
 }
 
-static void __exit driver_exit(void)
+static void __exit kvm_probe_exit(void)
 {
     int i;
 
@@ -715,8 +734,8 @@ static void __exit driver_exit(void)
     pr_info("%s: Exited\n", DRIVER_NAME);
 }
 
-module_init(kvm_probe_driver_init);
-module_exit(driver_exit);
+module_init(kvm_probe_init);
+module_exit(kvm_probe_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("CTF Player");
