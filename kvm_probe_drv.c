@@ -45,10 +45,22 @@
 #define MAX_VIRTIO_DEVICES 8
 #define VIRTIO_NET_DEVICE_ID 1
 
-// Define KVM_HC_VIRTIO_NOTIFY if not available in headers
-#ifndef KVM_HC_VIRTIO_NOTIFY
-#define KVM_HC_VIRTIO_NOTIFY 6
+// Define KVM hypercalls for CTF flags
+#ifndef KVM_HC_CTF_FLAG_100
+#define KVM_HC_CTF_FLAG_100 100
 #endif
+#ifndef KVM_HC_CTF_FLAG_102
+#define KVM_HC_CTF_FLAG_102 102
+#endif
+#ifndef KVM_HC_CTF_FLAG_103
+#define KVM_HC_CTF_FLAG_103 103
+#endif
+
+// CTF Flag addresses (from challenge description)
+#define WRITE_FLAG_VA   0xffffffff826279a8UL
+#define WRITE_FLAG_PA   0x64279a8UL
+#define READ_FLAG_VA    0xffffffff82b5ee10UL
+#define READ_FLAG_PA    0x695ee10UL
 
 /* Global state for the virtual queue page */
 static void *g_vq_virt_addr = NULL;
@@ -97,6 +109,10 @@ static int num_virtio_devices = 0;
 #define IOCTL_FIRE_VQ_ALL        0x1016
 #define IOCTL_SEND_NET_PACKET    0x1017
 #define IOCTL_RECV_NET_PACKET    0x1018
+#define IOCTL_CTF_TRIGGER_FLAG   0x1019
+#define IOCTL_CTF_READ_FLAG      0x101A
+#define IOCTL_CTF_WRITE_FLAG     0x101B
+#define IOCTL_CTF_KASAN_TRIGGER  0x101C
 
 /* Structures (mirror prober) */
 struct port_io_data {
@@ -154,6 +170,11 @@ struct net_packet_data {
     unsigned char *packet_data;
     unsigned int   packet_len;
     unsigned int   device_id;
+};
+struct ctf_flag_data {
+    unsigned int flag_id;
+    unsigned long address;
+    unsigned long value;
 };
 
 /* Function pointers for set_memory_* that are filled at init time */
@@ -224,6 +245,14 @@ static int create_net_packet(unsigned char *buffer, unsigned int *length,
 
     *length = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + 10;
     return 0;
+}
+
+// CTF-specific function to trigger KASAN violation
+static void trigger_kasan_violation(void)
+{
+    volatile unsigned long *null_ptr = NULL;
+    // This should trigger a KASAN null-ptr-deref violation
+    *null_ptr = 0xdeadbeef;
 }
 
 static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -597,9 +626,113 @@ static long driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                                     ret = 0;
                                     break;
                                 }
-                                default:
-                                    ret = -ENOTTY;
+                                // CTF-specific IOCTLs
+                                case IOCTL_CTF_TRIGGER_FLAG: {
+                                    struct ctf_flag_data data;
+                                    unsigned long hypercall_ret;
+
+                                    if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
+
+                                    if (allow_untrusted_hypercalls) {
+                                        switch (data.flag_id) {
+                                            case 100:
+                                                hypercall_ret = kvm_hypercall0(KVM_HC_CTF_FLAG_100);
+                                                break;
+                                            case 102:
+                                                hypercall_ret = kvm_hypercall0(KVM_HC_CTF_FLAG_102);
+                                                break;
+                                            case 103:
+                                                hypercall_ret = kvm_hypercall0(KVM_HC_CTF_FLAG_103);
+                                                break;
+                                            default:
+                                                return -EINVAL;
+                                        }
+
+                                        if (copy_to_user(user_arg, &hypercall_ret, sizeof(hypercall_ret)))
+                                            ret = -EFAULT;
+                                        else
+                                            ret = 0;
+                                    } else {
+                                        ret = -EACCES;
+                                    }
                                     break;
+                                }
+
+                                case IOCTL_CTF_READ_FLAG: {
+                                    struct ctf_flag_data data;
+                                    unsigned long flag_value;
+
+                                    if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
+
+                                    // Read from the read flag address
+                                    if (data.address == READ_FLAG_VA || data.address == READ_FLAG_PA) {
+                                        void __iomem *virt_addr;
+
+                                        if (data.address == READ_FLAG_PA) {
+                                            virt_addr = ioremap(READ_FLAG_PA, sizeof(unsigned long));
+                                        } else {
+                                            virt_addr = (void __iomem *)READ_FLAG_VA;
+                                        }
+
+                                        if (!virt_addr) return -ENOMEM;
+
+                                        flag_value = readq(virt_addr);
+
+                                        if (data.address == READ_FLAG_PA) {
+                                            iounmap(virt_addr);
+                                        }
+
+                                        if (copy_to_user(&((struct ctf_flag_data __user *)user_arg)->value,
+                                                        &flag_value, sizeof(flag_value)))
+                                            ret = -EFAULT;
+                                        else
+                                            ret = 0;
+                                    } else {
+                                        ret = -EINVAL;
+                                    }
+                                    break;
+                                }
+
+        case IOCTL_CTF_WRITE_FLAG: {
+            struct ctf_flag_data data;
+
+            if (copy_from_user(&data, user_arg, sizeof(data))) return -EFAULT;
+
+            // Write to the write flag address
+            if (data.address == WRITE_FLAG_VA || data.address == WRITE_FLAG_PA) {
+                void __iomem *virt_addr;
+
+                if (data.address == WRITE_FLAG_PA) {
+                    virt_addr = ioremap(WRITE_FLAG_PA, sizeof(unsigned long));
+                } else {
+                    virt_addr = (void __iomem *)WRITE_FLAG_VA;
+                }
+
+                if (!virt_addr) return -ENOMEM;
+
+                writeq(data.value, virt_addr);
+
+                if (data.address == WRITE_FLAG_PA) {
+                    iounmap(virt_addr);
+                }
+
+                ret = 0;
+            } else {
+                ret = -EINVAL;
+            }
+            break;
+        }
+
+        case IOCTL_CTF_KASAN_TRIGGER: {
+            // Trigger KASAN violation for CTF
+            trigger_kasan_violation();
+            ret = 0;
+            break;
+        }
+
+        default:
+            ret = -ENOTTY;
+            break;
     }
 
     return ret;
