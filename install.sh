@@ -2,8 +2,8 @@
 set -e
 
 # Update and install required packages
-sudo apt update
-sudo apt install -y make xxd gdb build-essential binutils linux-compiler-gcc-12-x86 linux-kbuild-6.1 wget
+apt update
+apt install -y sudo pip make xxd gdb build-essential binutils linux-compiler-gcc-12-x86 linux-kbuild-6.1 wget
 
 # Download kernel headers
 wget -q https://debian.sipwise.com/debian-security/pool/main/l/linux/linux-headers-6.1.0-21-common_6.1.90-1_all.deb
